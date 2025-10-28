@@ -93,6 +93,8 @@ class WP_AGUI_Chat_Plugin {
       'dbToken' => $cfg['db_token'],
       // Server-side image generation endpoint (avoids mixed-content and localhost issues)
       'wpImageEndpoint' => rest_url('agui-chat/v1/image/generate'),
+      // Server-side brand name generation endpoint used in Step 3
+      'wpBrandnameEndpoint' => rest_url('agui-chat/v1/brandname/generate'),
       'agentImageEndpoint' => $agent_image_endpoint,
       // Live settings endpoint so frontend can synchronize in real-time
       'wpSettingsEndpoint' => rest_url('agui-chat/v1/settings'),
@@ -216,9 +218,9 @@ class WP_AGUI_Chat_Plugin {
       <!-- Step 1: Describe business + Name + Email -->
       <form id="bmms-step1" class="bmms-step active" autocomplete="off">
         <div class="bmms-splash-header">
-          <div class="bmms-logo-anim" aria-hidden="true">
+          <!-- <div class="bmms-logo-anim" aria-hidden="true">
             <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-          </div>
+          </div> -->
           <h2 class="bmms-title">Hi, I'm your AI-powered assistant.</h2>
           <p class="bmms-sub">Let’s create a logo together.</p>
         </div>
@@ -568,6 +570,19 @@ class WP_AGUI_Chat_Plugin {
       'callback' => [$this, 'rest_ghl_tag'],
       'permission_callback' => '__return_true', // public for now; add nonce/rate-limit in production
     ]);
+    // New: Webhook endpoint to receive booking events from GHL automations
+    register_rest_route('agui-chat/v1', '/ghl/webhook', [
+      'methods' => 'POST',
+      'callback' => [$this, 'rest_ghl_webhook'],
+      'permission_callback' => '__return_true',
+    ]);
+
+    // New: Brand name generator used by Step 3
+    register_rest_route('agui-chat/v1', '/brandname/generate', [
+      'methods' => 'POST',
+      'callback' => [$this, 'rest_brandname_generate'],
+      'permission_callback' => '__return_true', // public; add nonce/rate-limit in production
+    ]);
   }
 
   public function rest_ghl_contact($request){
@@ -813,6 +828,98 @@ class WP_AGUI_Chat_Plugin {
     return new WP_REST_Response(['ok'=>false,'error'=>is_wp_error($resp1)?$resp1->get_error_message():'Unknown error','contactId'=>$contactId,'tag'=>$tag], 500);
   }
 
+  // Receive GHL automation webhook on booking success; tag contact and return 200
+  public function rest_ghl_webhook($request){
+    $data = $request->get_json_params();
+    if(!$data){ $data = $request->get_body_params(); }
+    if(!$data){
+      $raw = method_exists($request,'get_body') ? $request->get_body() : '';
+      if($raw){ $decoded = json_decode($raw, true); if(is_array($decoded)) $data = $decoded; }
+    }
+
+    $cfg = self::get_settings();
+    if(empty($cfg['ghl_pit']) || empty($cfg['ghl_location_id'])){
+      return new WP_REST_Response(['ok'=>false,'error'=>'GHL not configured'], 400);
+    }
+
+    $token = trim($cfg['ghl_pit']);
+    if(stripos($token, 'bearer ') !== 0){ $token = 'Bearer '.$token; }
+    $base = rtrim($cfg['ghl_api_base'],'/');
+
+    // Extract contact id/email from common webhook shapes
+    $contactId = '';
+    $email = '';
+    $get = function($arr, $path){
+      $cur = $arr; foreach(explode('.', $path) as $seg){ if(is_array($cur) && array_key_exists($seg,$cur)){ $cur = $cur[$seg]; } else { return ''; } }
+      return is_string($cur)?$cur: (is_array($cur) && isset($cur['id'])? $cur['id'] : '');
+    };
+    $contactId = $get($data,'contact.id') ?: $get($data,'data.contact.id') ?: ($data['contactId'] ?? ($data['contact_id'] ?? ''));
+    $email = $get($data,'contact.email') ?: $get($data,'data.contact.email') ?: ($data['email'] ?? '');
+
+    $tag = isset($data['tag']) && $data['tag'] ? $data['tag'] : 'AGUI_AssetsReady';
+
+    // If no contactId, try lookup via email
+    if(!$contactId && $email){
+      $headers = [ 'Authorization' => $token, 'Accept' => 'application/json', 'Version' => $cfg['ghl_version'] ];
+      $urls = [
+        $base . '/contacts/search?locationId=' . urlencode($cfg['ghl_location_id']) . '&query=' . urlencode($email),
+        $base . '/contacts?locationId=' . urlencode($cfg['ghl_location_id']) . '&email=' . urlencode($email),
+        $base . '/contacts?email=' . urlencode($email),
+        $base . '/contacts/search?query=' . urlencode($email),
+      ];
+      foreach ($urls as $u) {
+        $res = wp_remote_get($u, [ 'headers' => $headers, 'timeout' => 20 ]);
+        if (is_wp_error($res)) { continue; }
+        $raw = wp_remote_retrieve_body($res);
+        $json = json_decode($raw, true);
+        if (is_array($json)) {
+          if (isset($json['contacts'][0]['id'])) { $contactId = $json['contacts'][0]['id']; }
+          elseif (isset($json['data']['contacts'][0]['id'])) { $contactId = $json['data']['contacts'][0]['id']; }
+          elseif (isset($json['contact']['id'])) { $contactId = $json['contact']['id']; }
+          elseif (isset($json['id'])) { $contactId = $json['id']; }
+          elseif (isset($json['data']['id'])) { $contactId = $json['data']['id']; }
+          elseif (isset($json['result']['contacts'][0]['id'])) { $contactId = $json['result']['contacts'][0]['id']; }
+        }
+        if ($contactId) break;
+      }
+    }
+
+    if(!$contactId){
+      return new WP_REST_Response(['ok'=>false,'error'=>'Contact not found'], 404);
+    }
+
+    $headers_common = [
+      'Authorization' => $token,
+      'Content-Type' => 'application/json',
+      'Accept' => 'application/json',
+      'Version' => $cfg['ghl_version'],
+    ];
+
+    // Try tagging via different endpoints
+    $body1 = [ 'contactId' => $contactId, 'tags' => [$tag], 'locationId' => $cfg['ghl_location_id'] ];
+    $resp1 = wp_remote_post($base.'/contacts/tags', [ 'headers' => $headers_common, 'body' => wp_json_encode($body1), 'timeout' => 20 ]);
+    if(!is_wp_error($resp1)){
+      $code1 = wp_remote_retrieve_response_code($resp1);
+      if($code1>=200 && $code1<300){ return new WP_REST_Response(['ok'=>true,'code'=>$code1,'contactId'=>$contactId,'tag'=>$tag,'source'=>'webhook'], 200); }
+    }
+    $body2 = [ 'tags' => [$tag] ];
+    $resp2 = wp_remote_post($base.'/contacts/'.$contactId.'/tags', [ 'headers' => $headers_common, 'body' => wp_json_encode($body2), 'timeout' => 20 ]);
+    if(!is_wp_error($resp2)){
+      $code2 = wp_remote_retrieve_response_code($resp2);
+      if($code2>=200 && $code2<300){ return new WP_REST_Response(['ok'=>true,'code'=>$code2,'contactId'=>$contactId,'tag'=>$tag,'source'=>'webhook'], 200); }
+    }
+    $body3 = [ 'tag' => $tag ];
+    $resp3 = wp_remote_post($base+'/contacts/'.$contactId.'/tags', [ 'headers' => $headers_common, 'body' => wp_json_encode($body3), 'timeout' => 20 ]);
+    if(!is_wp_error($resp3)){
+      $code3 = wp_remote_retrieve_response_code($resp3);
+      $raw3 = wp_remote_retrieve_body($resp3);
+      if($code3>=200 && $code3<300){ return new WP_REST_Response(['ok'=>true,'code'=>$code3,'contactId'=>$contactId,'tag'=>$tag,'source'=>'webhook'], 200); }
+      return new WP_REST_Response(['ok'=>false,'code'=>$code3,'error'=>$raw3,'contactId'=>$contactId,'tag'=>$tag], $code3);
+    }
+
+    return new WP_REST_Response(['ok'=>false,'error'=>is_wp_error($resp1)?$resp1->get_error_message():'Unknown error','contactId'=>$contactId,'tag'=>$tag], 500);
+  }
+
   // Helper: try Banana.dev image generation with polling
   private function try_banana_generate($api_key, $model_key, $prompt, $body_arr) {
     // Start the Banana.dev job
@@ -914,6 +1021,7 @@ class WP_AGUI_Chat_Plugin {
 
     // Nested/array shapes
     if (isset($d['images'][0]['url'])) $candidates[] = $d['images'][0]['url'];
+    if (isset($d['response']['images'][0]['url'])) $candidates[] = $d['response']['images'][0]['url'];
     if (isset($d['images'][0]['b64_json'])) $candidates[] = $d['images'][0]['b64_json'];
 
     if (isset($d['output']['images'][0]['url'])) $candidates[] = $d['output']['images'][0]['url'];
@@ -1052,7 +1160,13 @@ class WP_AGUI_Chat_Plugin {
         'Accept' => 'application/json',
       ];
       // Fal.run expects the payload under an "input" key
-      $resp = wp_remote_post($url, [ 'headers' => $headers, 'body' => json_encode(['input' => $body_arr]), 'timeout' => 30 ]);
+      $resp = wp_remote_post($url, [
+        'headers' => $headers,
+        'body' => json_encode(['input' => $body_arr]),
+        'timeout' => 45,
+        // Allow self-signed/outdated cert bundles on some hosts to avoid SSL errors
+        'sslverify' => false,
+      ]);
       if (!is_wp_error($resp)) {
         $code = wp_remote_retrieve_response_code($resp);
         $json = json_decode(wp_remote_retrieve_body($resp), true);
@@ -1091,7 +1205,8 @@ class WP_AGUI_Chat_Plugin {
 
     // 3) Banana.dev (short polling) if configured
     if ($banana_key && $banana_model) {
-      $banana_result = $this->try_banana_generate($banana_key, $banana_model, $prompt, $size, $guidance, $steps, $seed);
+      // Pass the whitelisted body parameters (prompt, size, etc.)
+      $banana_result = $this->try_banana_generate($banana_key, $banana_model, $prompt, $body_arr);
       if ($banana_result) {
         return $banana_result;
       }
@@ -1177,6 +1292,76 @@ $disable_fallback = is_string($disable_fallback_env)
     }
   }
 
+  // Step 3: Server-side brand name suggestion generator
+  public function rest_brandname_generate($request){
+    $data = $request->get_json_params();
+    if(!$data){ $data = $request->get_body_params(); }
+    if(!$data){
+      $raw = method_exists($request,'get_body') ? $request->get_body() : '';
+      if($raw){ $decoded = json_decode($raw, true); if(is_array($decoded)) $data = $decoded; }
+    }
+
+    $description = isset($data['description']) ? trim(strtolower($data['description'])) : '';
+    $current = isset($data['current']) ? trim($data['current']) : '';
+    $styles = isset($data['styles']) && is_array($data['styles']) ? $data['styles'] : [];
+    $style_words = array_map(function($s){ return strtolower(trim(preg_replace('/\s+/', ' ', $s))); }, $styles);
+
+    // Extract up to 3 meaningful roots from description/current
+    $base = $description ?: $current ?: 'brand';
+    preg_match_all('/[a-z]{3,}/i', $base, $m);
+    $roots = isset($m[0]) && count($m[0]) ? array_slice($m[0], 0, 3) : [$current ?: 'brand'];
+
+    // Build suggestions: prefixes/suffixes + style-influenced combos
+    $suffixes = ['Labs','Works','Co','Hub','Craft','Prime','Nova','Forge','Pulse','Nest','Studio','Flow','Spark','Mint','Rise'];
+    $prefixes = ['Swift','Ultra','Neo','Blue','Bright','True','Peak','Alpha','Vivid','Aero','Zen','Clear'];
+    $style_boost = array_map(function($s){ return preg_replace('/\s+/', '', ucwords($s)); }, $styles);
+
+    $cap = function($s){ return $s ? strtoupper(substr($s,0,1)) . substr($s,1) : ''; };
+    $score = function($name) use ($roots, $style_words){
+      $lower = strtolower($name);
+      $sc = 0;
+      foreach($roots as $r){ if($r && strpos($lower, strtolower($r)) !== false) $sc += 3; }
+      foreach($style_words as $sw){ if($sw && strpos($lower, $sw) !== false) $sc += 2; }
+      if(strlen($lower) <= 12) $sc += 1;
+      if(preg_match('/^[A-Za-z][A-Za-z]+$/', $name)) $sc += 1;
+      return $sc;
+    };
+
+    $set = [];
+    // Suffix combos
+    for($i=0; $i<count($suffixes) && count($set) < 8; $i++){
+      $ridx = $i % max(1, count($roots));
+      $r = $roots[$ridx] ?: 'brand';
+      $name = ($cap($r)) . $suffixes[($i*2) % count($suffixes)];
+      $set[$name] = $score($name);
+    }
+    // Prefix combos
+    for($i=0; $i<count($prefixes) && count($set) < 12; $i++){
+      $ridx = ($i+1) % max(1, count($roots));
+      $r = $roots[$ridx] ?: 'brand';
+      $name = $prefixes[$i % count($prefixes)] . ($cap($r));
+      $set[$name] = $score($name);
+    }
+    // Style influence combos
+    for($i=0; $i<count($style_boost) && count($set) < 16; $i++){
+      $ridx = $i % max(1, count($roots));
+      $r = $roots[$ridx] ?: 'brand';
+      $name = $style_boost[$i] . ($cap($r));
+      $set[$name] = $score($name);
+    }
+
+    // Rank suggestions by score
+    $names = array_keys($set);
+    usort($names, function($a,$b) use ($set){ return $set[$b] <=> $set[$a]; });
+    $suggestions = array_slice($names, 0, 6);
+
+    return new WP_REST_Response([
+      'ok' => true,
+      'status' => 200,
+      'data' => [ 'suggestions' => $suggestions ]
+    ], 200);
+  }
+
   // Fix 500s: implement /agui-chat/v1/settings to expose safe, non-secret settings
   public function rest_settings($request){
     $cfg = self::get_settings();
@@ -1206,10 +1391,12 @@ $disable_fallback = is_string($disable_fallback_env)
       'wpFormEndpoint' => rest_url('agui-chat/v1/ghl/contact'),
       'wpImageEndpoint' => rest_url('agui-chat/v1/image/generate'),
       'wpSettingsEndpoint' => rest_url('agui-chat/v1/settings'),
+      'wpBookingWebhook' => rest_url('agui-chat/v1/ghl/webhook'),
       'agentImageEndpoint' => $agent_image_endpoint,
       // Helpful flags (do not expose actual tokens)
       'ghl_configured' => !empty($cfg['ghl_pit']) && !empty($cfg['ghl_location_id']),
-      'fal_configured' => !empty($cfg['fal_key']),
+      // Consider environment config as well
+      'fal_configured' => (!empty($cfg['fal_key']) || !empty(getenv('FAL_KEY'))),
       'version' => '0.1.2',
     ];
     return new WP_REST_Response(['ok' => true, 'data' => $public], 200);

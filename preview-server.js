@@ -95,9 +95,10 @@ const server = http.createServer(async (req,res)=>{
     return sendJson(res, 200, publicCfg);
   }
 
-  // Image generation endpoint: proxy to WP if WP_ORIGIN is set, otherwise return SVG
+  // Image generation endpoint: proxy to WP if WP_ORIGIN is set; otherwise proxy to Agent if AGENT_IMAGE_ENDPOINT is set; else 503
   if (pathname === '/wp-json/agui-chat/v1/image/generate') {
     const WP_ORIGIN = process.env.WP_ORIGIN || '';
+    const AGENT_IMAGE_ENDPOINT = process.env.AGENT_IMAGE_ENDPOINT || '';
     const body = await parseBody(req);
     if (WP_ORIGIN) {
       const target = new url.URL('/wp-json/agui-chat/v1/image/generate', WP_ORIGIN);
@@ -117,9 +118,29 @@ const server = http.createServer(async (req,res)=>{
       rq.end(JSON.stringify(body||{}));
       return;
     }
-    const svg = svgFromPrompt(body && body.prompt);
-    const dataUri = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
-    return sendJson(res, 200, { ok:true, status:200, data: { image_url: dataUri } });
+    if (AGENT_IMAGE_ENDPOINT) {
+      try {
+        const target = new url.URL(AGENT_IMAGE_ENDPOINT);
+        const mod = target.protocol === 'https:' ? require('https') : require('http');
+        const rq = mod.request(target, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept':'application/json' }
+        }, (rs) => {
+          let data = '';
+          rs.on('data', (c) => data += c);
+          rs.on('end', () => {
+            try { sendJson(res, rs.statusCode || 200, JSON.parse(data)); }
+            catch(_) { res.writeHead(rs.statusCode || 200); res.end(data); }
+          });
+        });
+        rq.on('error', () => sendJson(res, 502, { error:'Proxy to Agent image generate failed' }));
+        rq.end(JSON.stringify(body||{}));
+        return;
+      } catch(e) {
+        return sendJson(res, 500, { error:'Invalid AGENT_IMAGE_ENDPOINT' });
+      }
+    }
+    return sendJson(res, 503, { error:'No image generation backend configured. Set WP_ORIGIN or AGENT_IMAGE_ENDPOINT.' });
   }
 
   // Contact creation endpoint (GHL stub)

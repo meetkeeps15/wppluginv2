@@ -384,81 +384,62 @@
 
   async function generateImage(prompt){
     console.log('generateImage called with prompt:', prompt);
-    const cfg = window.AGUiConfig || window.AGConfig || {};
-    let endpoints = [];
-    const wpEndpoint = (cfg.wpImageEndpoint || '/wp-json/agui-chat/v1/image/generate').replace(/\/$/, '');
+    const endpoints = [];
+    const wpEndpoint = (cfg.wpImageEndpoint || '').replace(/\/$/, '');
     const agentEndpoint = (cfg.agentImageEndpoint || '').replace(/\/$/, '');
-    const fastApiBase = (cfg.fastApiBase || '').replace(/\/$/, '');
-    const fastApiEndpoint = fastApiBase ? `${fastApiBase}/api/fal/generate` : (cfg.fastApiImageEndpoint || '').replace(/\/$/, '');
-
-    // Prefer WordPress first, then agent-server (with toggled scheme), then FastAPI
-    endpoints.push(wpEndpoint);
+    // Try WordPress first, then agent-server, then FastAPI
+    if(wpEndpoint){
+      endpoints.push(wpEndpoint);
+    }
     if(agentEndpoint) {
       endpoints.push(agentEndpoint);
+      // Scheme fallback: try toggled http/https variant if handshake fails
       try {
         const u = new URL(agentEndpoint);
         const toggled = (u.protocol === 'http:' ? 'https:' : 'http:') + '//' + u.host + (u.pathname || '') + (u.search || '');
         endpoints.push(toggled);
-      } catch(_) {}
+      } catch(e) {}
     }
-    if(fastApiEndpoint) endpoints.push(fastApiEndpoint);
-
-    // Feature flag: allow disabling non-WordPress fallbacks entirely
-    const disableFallbacks = !!(cfg.disableAgentFallbacks || cfg.disableNonWpFallbacks);
-    if(disableFallbacks) {
-      endpoints = [wpEndpoint];
-    }
-
+    const fastApi = (cfg.fastApiBase || '').replace(/\/$/, '');
+    if(fastApi){ endpoints.push(`${fastApi}/api/fal/generate`); }
     console.log('Image generation endpoints:', endpoints);
-
-    const timeoutFor = (endpoint, idx=0) => {
-      try {
-        const u = new URL(endpoint, window.location.origin);
-        const isWp = u.pathname.startsWith('/wp-json/agui-chat');
-        const isAgent = u.hostname.includes('ngrok') || u.pathname.includes('/api/');
-        const isFastApi = /\/api\/fal\//.test(u.pathname);
-        let base = isWp ? 25000 : isAgent ? 45000 : isFastApi ? 30000 : 20000;
-        return base + Math.min(idx, 3) * 7000;
-      } catch(_) { return 20000; }
-    };
-
-    for (let i=0; i<endpoints.length; i++){
-      const endpoint = endpoints[i];
-      try{
-        const headers = { 'Content-Type':'application/json' };
-        // ngrok header for agent endpoints
-        try {
-          const u = new URL(endpoint, window.location.origin);
-          const isAgent = u.hostname.includes('ngrok') || u.pathname.includes('/api/');
-          if (isAgent) headers['ngrok-skip-browser-warning'] = '1';
-        } catch(_) {}
-        const controller = new AbortController();
-        const tm = setTimeout(()=> controller.abort(), timeoutFor(endpoint, i));
-        const resp = await fetch(endpoint, { method:'POST', headers, body: JSON.stringify({ prompt }), signal: controller.signal});
-        clearTimeout(tm);
-        if(!resp.ok){ console.warn('Image generation not ok', resp.status, resp.statusText, 'via', endpoint); continue; }
-        const ct = (resp.headers.get('content-type')||'').toLowerCase();
-        if(ct.includes('application/json')){
-          const data = await resp.json().catch(()=>({}));
-          const url = normalizeImageUrl(extractImageUrl(data));
-          if(url){ renderImage(url, prompt); return; }
-        } else {
-          const txt = await resp.text().catch(()=>(''));
-          const url = normalizeImageUrl(txt);
-          if(url){ renderImage(url, prompt); return; }
+    try{
+      const resp = await fetch(endpoints[0], { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ prompt })});
+      if(!resp.ok){
+        // try next
+        for(let i=1;i<endpoints.length;i++){
+          const r2 = await fetch(endpoints[i], { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ prompt })});
+          if(r2.ok){
+            const ct2 = (r2.headers.get('content-type')||'').toLowerCase();
+            if(ct2.includes('application/json')){
+              const data2 = await r2.json().catch(()=>({}));
+              const u2 = normalizeImageUrl(extractImageUrl(data2));
+              if(u2) renderImage(u2, prompt);
+            } else {
+              const txt2 = await r2.text().catch(()=>(''));
+              const u2 = normalizeImageUrl(txt2);
+              if(u2) renderImage(u2, prompt);
+            }
+            return;
+          }
         }
-        console.warn('No valid image returned via', endpoint);
-      } catch(e){ 
-        if (e && (e.name === 'AbortError' || String(e).includes('aborted'))) {
-          console.warn('Image generation timed out via', endpoint, '— will try next endpoint.');
-        } else {
-          console.error('Image generation error via', endpoint, e);
-        }
-        continue;
+        renderMessage({role:'assistant', text:'Could not generate image.'});
+        return;
       }
+      const ct = (resp.headers.get('content-type')||'').toLowerCase();
+      if(ct.includes('application/json')){
+        const data = await resp.json().catch(()=>({}));
+        const url = normalizeImageUrl(extractImageUrl(data));
+        if(url) renderImage(url, prompt);
+      } else {
+        const txt = await resp.text().catch(()=>(''));
+        const url = normalizeImageUrl(txt);
+        if(url) renderImage(url, prompt);
+      }
+    }catch(e){ 
+      console.error('Image generation error:', e);
+      renderMessage({role:'assistant', text:'Image generation failed.'}); 
     }
-
-    renderMessage({role:'assistant', text:'Could not generate image.'});
   }
 
   // Test function to render a sample image
@@ -2643,14 +2624,8 @@
     s2: q('#bmms-step2', root),
     s3: q('#bmms-step3', root),
     s4: q('#bmms-step4', root),
-    s5: q('#bmms-step5', root),
-    s6: q('#bmms-step6', root),
-    s7: q('#bmms-step7', root),
-    s8: q('#bmms-step8', root),
-    s9: q('#bmms-step9', root)
+    s5: q('#bmms-step5', root)
   };
-  const stepOrder = ['s1','s2','s3','s4','s5','s6','s7','s8','s9'];
-  const progressEl = q('.bmms-progress', root);
   function showStep(s, fromBack = false){ 
     Object.values(steps).forEach(el=>{ if(el){ el.classList.remove('active'); el.style.display='none'; } }); 
     if(s && steps[s]){ 
@@ -2664,109 +2639,16 @@
          const bmmsFields = qa('.bmms-fields', form);
          bmmsFields.forEach(el=>{ el.style.display='block'; });
       }
-      // Show Step 6 fields (hide splash)
-      if(s === 's6'){
-        const sp = q('.bmms-splash', steps.s6);
-        const fld = q('.bmms-fields', steps.s6);
-        setTimeout(()=>{ if(sp) sp.style.display='none'; if(fld) fld.style.display=''; }, 600);
-      }
-      // Update Selected Styles summary when entering Step 3
-      if(s === 's3'){
-        const stylesEl = q('#bmms-selected-styles', steps.s3);
-        if(stylesEl){
-          const styles = (state.styles||[]).join(', ');
-          stylesEl.textContent = styles ? `Selected styles: ${styles}` : '';
-          stylesEl.style.display = styles ? '' : 'none';
-        }
-      }
-      // Update progress pill
-      try{
-        if(progressEl){ const i = stepOrder.indexOf(s); if(i>=0){ progressEl.textContent = `Step ${i+1} of ${stepOrder.length}`; } }
-      }catch(_){ }
-      // persist current step
-      try{ sessionStorage.setItem('bmms_step', s); }catch(e){}
     } 
   }
-  const state = { name:'', email:'', description:'', icon:'gauge', brand_text:'', slides:[], selected:null, styles:[], nameInputBound:false };
-
-  // Logo style seeds mapping and combiner
-  const stylePromptSeeds = {
-    'Futuristic': { prompt: 'Create a sleek, tech-forward logo using gradients, neon hues, and streamlined shapes. Should evoke innovation and cutting-edge aesthetics.', guide: 'glowing effects, geometric lines, metallic/dark backgrounds, dynamic motion elements.' },
-    'Elegant': { prompt: 'Design a refined, graceful logo with flowing script fonts and gold or pastel accents. Emphasize sophistication and luxury.', guide: 'delicate typography, high contrast, fine lines, serif or script.' },
-    'Corporate': { prompt: 'Professional, trustworthy, clean modern aesthetic with a strong icon.', guide: 'blue/gray palette, sans-serif, bold minimal icon.' },
-    'Classic': { prompt: 'Timeless, authoritative, vintage typography.', guide: 'ornamental borders, serif, gold/black or B/W, emblem layout.' },
-    'Geometric': { prompt: 'Clean abstract logo using sharp, symmetrical forms.', guide: 'polygonal/isometric elements, limited palette, balanced proportions.' },
-    'Abstract': { prompt: 'Fluid shapes and dynamic non-literal forms representing creativity.', guide: 'blended colors, organic curves, overlapping layers.' },
-    'Hand-draw': { prompt: 'Handmade, sketch-style with natural imperfection.', guide: 'ink/pencil textures, earthy tones, expressive lines.' },
-    'Mascot': { prompt: 'Friendly illustrated character that’s playful and memorable.', guide: 'bold outlines, vibrant colors, cartoon proportions.' },
-    'Minimalist': { prompt: 'Stripped-down essentials; clean and functional.', guide: 'monochrome, whitespace, sans-serif, icon focus.' },
-    'Symbolic': { prompt: 'Meaningful symbol representing values/ideas.', guide: 'geometric/metaphoric shapes, line-based.' },
-    'Vintage': { prompt: 'Retro-inspired with classic type and ornamental detail.', guide: 'badge/stamp layout, textured fonts, muted palette.' },
-    'Art Deco': { prompt: '1920s-inspired symmetry and luxe styling.', guide: 'gold/black, intricate linework, bold uppercase type.' },
-    'Grunge': { prompt: 'Rough, edgy with distressed textures.', guide: 'grungy fonts, splatter, dark/muted colors.' },
-    'Modern': { prompt: 'Clean, forward-looking, tech-influenced minimalism.', guide: 'flat/semi-flat, smooth gradients, blue tones.' },
-    'Nature': { prompt: 'Organic, eco-friendly elements (leaves/animals).', guide: 'green/earth tones, soft curves, natural motifs.' },
-    'Monogram': { prompt: 'Stylized letter-based/initials logo.', guide: 'interlocking letters, serif/calligraphic, gold/black, symmetry.' },
-    'Line Art': { prompt: 'Outline-based, clean continuous lines.', guide: 'single-weight strokes, minimal shading.' }
-  };
-  function buildStyleSeeds(styles){
-    const chosen = (Array.isArray(styles) ? styles : []).filter(Boolean).slice(0,3);
-    if(chosen.length === 0) return '';
-    const parts = chosen.map((name, i)=>{
-      const s = stylePromptSeeds[name];
-      const weight = [1.0, 0.7, 0.5][i] || 0.3;
-      return `${name} style (${weight}): ${s?.prompt||''} Guidance: ${s?.guide||''}`;
-    });
-    return `Incorporate style guidance: ${parts.join(' | ')}`;
-  }
-  // persistence helpers
-  const STORAGE_KEY = 'bmms_state';
-  function saveState(){ try{ sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){} }
-  function restore(){
-    try{
-      const raw = sessionStorage.getItem(STORAGE_KEY);
-      if(raw){ const s = JSON.parse(raw); if(s && typeof s === 'object') Object.assign(state, s); }
-      const stepSaved = sessionStorage.getItem('bmms_step');
-      if(stepSaved && steps[stepSaved]){ showStep(stepSaved); } else { showStep('s1'); }
-    }catch(e){ showStep('s1'); }
-  }
-  async function createContact(payload){
-    const cfg = window.AGUiConfig || window.AGConfig || {};
-    const endpoint = (cfg.wpFormEndpoint||'/wp-json/agui-chat/v1/ghl/contact');
-    const resp = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning':'true' }, body: JSON.stringify(payload||{}) });
-    const j = await resp.json().catch(()=>({}));
-    if(!resp.ok || j.ok === false){ throw new Error('Contact creation failed'); }
-    const data = j.data || j;
-    state.contact_id = data.contact_id || '';
-    state.session_id = data.session_id || '';
-    saveState();
-    return data;
-  }
-
-  // New: send a GHL tag to mark assets ready
-  async function sendGhlTag(tagName, meta){
-    const cfg = window.AGUiConfig || window.AGConfig || {};
-    const endpoint = (cfg.wpTagEndpoint || '/wp-json/agui-chat/v1/ghl/tag');
-    const payload = {
-      contact_id: state.contact_id || '',
-      email: state.email || '',
-      tag: tagName || 'AGUI_AssetsReady',
-      meta: meta || {}
-    };
-    try{
-      const resp = await fetch(endpoint, { method:'POST', headers:{ 'Content-Type':'application/json', 'ngrok-skip-browser-warning':'true' }, body: JSON.stringify(payload) });
-      const j = await resp.json().catch(()=>({}));
-      if(!resp.ok || j.ok === false){ console.warn('GHL tag failed', resp.status, j); return false; }
-      return true;
-    }catch(err){ console.warn('GHL tag error', err); return false; }
-  }
+  const state = { name:'', email:'', description:'', icon:'gauge', brand_text:'', slides:[], selected:null };
   
   // Close button hides the overlay
   /* bmms-close removed per request */
 
   // Step 1 submit
   const form1 = steps.s1; if(form1){
-    form1.addEventListener('submit', async function(ev){ ev.preventDefault();
+    form1.addEventListener('submit', function(ev){ ev.preventDefault();
       state.name = q('input[name="name"]', form1)?.value?.trim()||'';
       state.email = q('input[name="email"]', form1)?.value?.trim()||'';
       // description is required
@@ -2777,18 +2659,6 @@
         if(descInput){ descInput.focus(); }
         return;
       }
-      // call contact creation endpoint before proceeding
-      const btn = form1.querySelector('button[type="submit"]');
-      if(btn){ btn.disabled = true; btn.textContent = 'Starting…'; }
-      try{
-        await createContact({ name: state.name, email: state.email, handle: '', description: state.description });
-      }catch(e){
-        showInlineError(form1, 'Could not start session. Please try again.');
-        if(btn){ btn.disabled = false; btn.textContent = 'Get Started'; }
-        return;
-      }
-      saveState();
-      if(btn){ btn.disabled = false; btn.textContent = 'Get Started'; }
       showStep('s2');
       setTimeout(()=>{ const sp=q('.bmms-splash', steps.s2); if(sp) sp.style.display='none'; const ops=q('.bmms-options', steps.s2); if(ops){ ops.style.display=''; ops.classList.add('show'); try{ ops.style.pointerEvents = 'auto'; ops.style.opacity = '1'; const btns = Array.from(ops.querySelectorAll('.bmms-style-btn')); btns.forEach(b=>{ try{ b.style.pointerEvents = 'auto'; b.setAttribute('tabindex','0'); }catch(_){} }); }catch(_){} } }, 900);
     });
@@ -2832,252 +2702,40 @@
         });
       }, 0);
     }
-    /* Logo ideas removed (minimal UI) */
+    renderLogoIdeasOptions();
 
     s2.addEventListener('click', function(e){
       const t = e.target;
       if(t.closest('.bmms-back')){ showStep('s1', true); return; }
-
-      // Style selection (multi-select up to 3)
-      if(t.closest('.bmms-style-btn')){
-        const btn = t.closest('.bmms-style-btn');
-        const name = btn?.dataset?.style || '';
-        if(!name) return;
-        const idx = state.styles.indexOf(name);
-        if(idx >= 0){ state.styles.splice(idx,1); btn.classList.remove('active'); }
-        else {
-          if(state.styles.length >= 3){ showInlineError(s2, 'You can pick up to 3 styles.'); return; }
-          state.styles.push(name); btn.classList.add('active');
-        }
-        saveState();
-        return;
-      }
-
       if(t.closest('.bmms-next')){
-        // Optional social summary if handle provided
-        const handle = q('input[name="social_handle"]', s2)?.value?.trim()||'';
-        const summaryEl = q('.bmms-social-summary', s2);
-        if(handle && summaryEl && !state._socialSummarized){
-          summaryEl.style.display='block';
-          summaryEl.textContent = `Scanning ${handle}… audience ~growth-focused, engagement moderate; tone: upbeat, informative.`;
-          state._socialSummarized = true; saveState();
-          // brief pause before proceeding
-          setTimeout(()=>{ t.click(); }, 800);
-          return;
-        }
-        // Capture selected icon choice (legacy; optional)
+        // Capture selected icon choice (if present)
         const checkedIcon = q('input[name="bmms_icon"]:checked', s2);
         state.icon = checkedIcon?.value || state.icon || 'modern';
-        // Skip concept selection; proceed with styles only
-        state.selectedIdea = '';
+        const checked = q('input[name="bmms_logoidea"]:checked', s2);
+        if(!checked){
+          showInlineError(s2, 'Please select a logo idea to continue.');
+          return;
+        }
+        // Ensure absolute URL for image foundation
+        let val = checked.value || '';
+        try {
+          if (!/^https?:\/\//i.test(val)) {
+            val = new URL(val, window.location.origin).href;
+          }
+        } catch(e) {}
+        state.selectedIdea = val;
         showStep('s3');
-        setTimeout(()=>{
-          const sp=q('.bmms-splash', steps.s3); if(sp) sp.style.display='none';
-          const fld=q('.bmms-fields', steps.s3); if(fld) fld.style.display='';
-          const desc=q('textarea[name="brand_desc"]', steps.s3);
-           if(desc && !desc.value){
-             const styles = (state.styles||[]).join(', ');
-             if(styles){ desc.value = `Brand vibe: ${styles}. Aim for clean, minimalist, modern. Keep typography legible and spacing balanced.`; }
-           }
-          const stylesEl = q('#bmms-selected-styles', steps.s3);
-          if(stylesEl){
-            const styles = (state.styles||[]).join(', ');
-            stylesEl.textContent = styles ? `Selected styles: ${styles}` : '';
-            stylesEl.style.display = styles ? '' : 'none';
-          }
-          // Bind brand name input events once
-          const inp = q('input[name="brand_text"]', steps.s3);
-          if(inp && !state.nameInputBound){
-            let to=null;
-            inp.addEventListener('input', function(){
-              if(to) clearTimeout(to);
-              to = setTimeout(()=>{ if(inp.value.trim().length>=1) generateNames(); }, 350);
-            });
-            inp.addEventListener('keydown', function(ev){ if(ev.key==='Enter'){ ev.preventDefault(); generateNames(); } });
-            state.nameInputBound = true;
-          }
-          // Ensure a status line exists
-          const fields = q('.bmms-fields', steps.s3);
-          if(fields){ let st = q('#bmms-name-status', steps.s3); if(!st){ st=document.createElement('div'); st.id='bmms-name-status'; st.style.cssText='margin-top:6px;color:#6b7280;font-size:12px;'; fields.appendChild(st); } }
-          // Ensure a suggestions host exists
-          try {
-            const fieldsEl = q('.bmms-fields', steps.s3);
-            if (fieldsEl) {
-              let host = q('.bmms-name-options', steps.s3);
-              if (!host) {
-                host = document.createElement('div');
-                host.className = 'bmms-name-options';
-                host.style.cssText = 'display:none; flex-wrap:wrap; gap:8px; margin-top:8px;';
-                fieldsEl.appendChild(host);
-              }
-            }
-          } catch(e){}
-          // Hide any manual generate button; auto-suggest is enabled
-          try{ const genBtn = q('.bmms-generate', steps.s3); if(genBtn){ genBtn.style.display='none'; } }catch(_){}
-          // If jQuery is available, add equivalent input binding
-          try {
-            if (window.jQuery) {
-              const $ = window.jQuery;
-              const $inp = $(q('input[name="brand_text"]', steps.s3));
-              if ($inp && $inp.length) {
-                let dTo = null;
-                $inp.off('input.agui').on('input.agui', function(){
-                  if (dTo) clearTimeout(dTo);
-                  const v = String($(this).val()||'').trim();
-                  dTo = setTimeout(function(){ if(v.length>=1) generateNames(); }, 350);
-                });
-                $inp.off('keypress.agui').on('keypress.agui', function(ev){ if(ev.key==='Enter'){ ev.preventDefault(); generateNames(); } });
-              }
-            }
-          } catch(e){}
-          // Auto-generate suggestions when arriving, if we have context
-          try{
-            const cur = q('input[name="brand_text"]', steps.s3)?.value?.trim()||'';
-            const hasCtx = (desc && desc.value) || ((state.styles||[]).length);
-            if(hasCtx && !cur){ generateNames(); }
-          }catch(_){ }
-        }, 900);
+        setTimeout(()=>{ const sp=q('.bmms-splash', steps.s3); if(sp) sp.style.display='none'; const fld=q('.bmms-fields', steps.s3); if(fld) fld.style.display=''; }, 900);
       }
     });
   }
 
   // Step 3
   const s3 = steps.s3; if(s3){
-    function renderNameOptions(list){
-      const host = q('.bmms-name-options', s3); if(!host) return;
-      host.innerHTML = '';
-      list.forEach((nm)=>{
-        const btn = document.createElement('button');
-        btn.type = 'button'; btn.className = 'bmms-btn bmms-name-choice';
-        btn.textContent = nm;
-        btn.addEventListener('click', ()=>{
-          const inp = q('input[name="brand_text"]', s3); if(inp){ inp.value = nm; }
-          host.style.display='none';
-        });
-        host.appendChild(btn);
-      });
-      host.style.display = list.length ? '' : 'none';
-    }
-    function setNameStatus(msg, type){
-      const st = q('#bmms-name-status', s3);
-      if(!st) return;
-      if(!msg){ st.textContent=''; st.style.display='none'; return; }
-      st.style.display='';
-      st.textContent = msg;
-      st.style.color = (type==='error') ? '#dc2626' : (type==='warn') ? '#b45309' : '#6b7280';
-    }
-    async function generateNames(){
-      // Read latest inputs
-      const desc = (q('textarea[name="brand_desc"]', s3)?.value?.trim() || '').toLowerCase();
-      const current = (q('input[name="brand_text"]', s3)?.value?.trim() || '');
-      // Strongly anchor suggestions to ALL words the user typed
-      const curTokens = (current || '').toLowerCase().match(/[a-z0-9]+/g) || [];
-      const curWords = (current||'').trim().split(/\s+/).filter(Boolean);
-      const uniqueTokens = Array.from(new Set(curTokens)).filter(Boolean);
-      const curRoot = uniqueTokens.length ? uniqueTokens[uniqueTokens.length-1] : '';
-      const baseWords = ((state.description||'') + ' ' + desc).toLowerCase().match(/[a-z]{3,}/g) || [];
-      const roots = uniqueTokens.length ? uniqueTokens.slice(0,3) : [curRoot].concat(baseWords.filter(Boolean)).slice(0,3).filter(Boolean);
-      const cap = s => s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
-      const host = q('.bmms-name-options', s3);
-      if(host){ host.style.display=''; host.innerHTML = '<div style="padding:8px;color:#6b7280">Generating name ideas…</div>'; }
-
-      // Prefer WordPress endpoint if available
-      const cfg = window.AGUiConfig || window.AGConfig || {};
-      const endpoint = (cfg.wpBrandnameEndpoint || '/wp-json/agui-chat/v1/brandname/generate');
-      try{
-        const payload = { description: desc || state.description || '', styles: (state.styles||[]), current };
-        const resp = await fetch(endpoint, { method:'POST', headers:{ 'Content-Type':'application/json', 'ngrok-skip-browser-warning':'true' }, body: JSON.stringify(payload) });
-        const j = await resp.json().catch(()=>({}));
-        if(resp.ok){
-          let names = (j?.data?.suggestions || j?.suggestions || []).map(s=> typeof s==='string' ? s : s?.name).filter(Boolean);
-          // Deduplicate and rank by simple relevance to description/styles
-          const styles = (state.styles||[]).map(s=> String(s).toLowerCase());
-          const score = (name)=>{
-            let sc = 0; const lower = String(name||'').toLowerCase();
-            // Weight matches to any token the user typed; bonus if multiple match
-            let matchedTokens = 0;
-            uniqueTokens.forEach(tok=>{ if(tok && lower.includes(tok)) { sc += 4; matchedTokens++; } });
-            if(matchedTokens >= 2) sc += 2; // multi-token relevance bonus
-            roots.forEach(r=>{ if(r && lower.includes(String(r).toLowerCase())) sc+=2; });
-            styles.forEach(s=>{ if(lower.includes(s)) sc+=2; });
-            if(lower.length <= 12) sc+=1; // brevity preference
-            if(/^[A-Za-z][A-Za-z]+$/.test(name)) sc+=1; // clean word form
-            return sc;
-          };
-          names = Array.from(new Set(names));
-          names.sort((a,b)=> score(b)-score(a));
-          setNameStatus('Connected: WordPress name suggestions','ok');
-          renderNameOptions(names.slice(0,6));
-          return;
-        } else {
-          // Suppress server error status in UI; fallback will render suggestions silently
-          setNameStatus('', '');
-        }
-      }catch(err){ console.warn('Brandname endpoint failed, using local generator.', err); setNameStatus('', ''); }
-
-      // Fallback: Local generator anchored to current input with style influence
-      const root = curRoot || (roots[0] || 'brand');
-      const R = cap(root);
-      const suffixes = ['ly','ify','io','ora','ity','ster','zen','sy','za','zo']; // short brandy suffixes
-      const nouns = ['Labs','Works','Co','Hub','Craft','Prime','Nova','Forge','Pulse','Nest','Studio','Flow','Spark','Mint','Rise'];
-      const prefixes = ['Neo','Pro','Ultra','Go','My','True','Peak','Alpha','Vivid','Aero','Zen','Clear','Brand','Vibe'];
-      const styleInfluence = (state.styles||[]).map(s=> cap(String(s).replace(/\s+/g,'')));
-      const combos = new Set();
-      if(host){ host.innerHTML=''; }
-      // Generate variants for each token the user typed (up to 3 tokens)
-      const tokenCaps = (uniqueTokens.length ? uniqueTokens : [root]).slice(0,3).map(cap);
-      tokenCaps.forEach(T => {
-        // Morphological variants
-        suffixes.forEach(sfx=> combos.add(T + sfx));
-        // Corporate-style nouns
-        nouns.forEach(n=> combos.add(T + n));
-        // Prefix combos
-        prefixes.forEach(p=> combos.add(p + T));
-        // Style-influenced
-        styleInfluence.forEach(s=> combos.add(s + T));
-        // Vowel-light variant
-        const vowelless = T.replace(/[aeiou]/ig,'');
-        if(vowelless.length>=2) combos.add(vowelless + 'io');
-      });
-
-      // Multi-word merges (pairwise and triple)
-      if(curWords.length >= 2){
-        const caps = curWords.map(w=> cap(w));
-        // Pairwise concatenations
-        for(let i=0;i<caps.length;i++){
-          for(let j=i+1;j<caps.length;j++){
-            const pair = caps[i] + caps[j];
-            combos.add(pair);
-            nouns.forEach(n=> combos.add(pair + ' ' + n));
-          }
-        }
-        // Triple concatenation and with noun
-        if(caps.length >= 3){
-          const triple = caps[0] + caps[1] + caps[2];
-          combos.add(triple);
-          combos.add(triple + ' Labs');
-        }
-        // Acronym + noun
-        const acronym = caps.map(c=> c[0]).join('');
-        if(acronym.length >= 2){ combos.add(acronym.toUpperCase()); combos.add(acronym.toUpperCase() + ' Studio'); }
-      }
-
-      const list = Array.from(combos)
-        .map(s=> s.replace(/\s+/g,' ').trim())
-        .filter(n=> n.length<=18)
-        .slice(0,12);
-      if(list.length === 0){
-        if(host){ host.innerHTML = '<div style="padding:8px;color:#dc2626">Unable to generate suggestions. Please add a short brand description or try again.</div>'; }
-        setNameStatus('Unable to generate suggestions','error');
-        return;
-      }
-      renderNameOptions(list);
-    }
-
     s3.addEventListener('click', function(e){
       const t = e.target;
       if(t.closest('.bmms-back')){ showStep('s2'); return; }
-      if(t.closest('.bmms-generate')){ generateNames(); return; }
+      if(t.closest('.bmms-skip')){ state.brand_text=''; showStep('s4'); buildVariations(); return; }
       if(t.closest('.bmms-next')){ state.brand_text = q('input[name="brand_text"]', s3)?.value?.trim()||''; showStep('s4'); buildVariations(); }
     });
   }
@@ -3089,34 +2747,17 @@
     const wrap = q('.bmms-slides', s4); if(!wrap) return; wrap.innerHTML='';
     const nextBtn = q('.bmms-next', s4); if(nextBtn) nextBtn.disabled = true;
     
-    const totalN = 6;
-    // Show loading state with animated counter
-    wrap.innerHTML = '<div style="text-align:center; padding: 40px; color: #6b7280;">'
-      + 'Generating AI logos… <span id="bmms-progress-count">0</span>/<span id="bmms-progress-total">'+totalN+'</span>'
-      + '<div style="margin-top:10px; height:6px; background:#eee; border-radius:3px; overflow:hidden;">'
-        + '<div id="bmms-progress-bar" style="width:0%; height:100%; background:#6366f1; transition: width 0.25s ease;"></div>'
-      + '</div>'
-    + '</div>';
-    const countEl = q('#bmms-progress-count', s4);
-    const barEl = q('#bmms-progress-bar', s4);
+    // Show loading state
+    wrap.innerHTML = '<div style="text-align: center; padding: 40px; color: #6b7280;">Generating AI logos...</div>';
     
     try {
-      let generated = 0;
-      let variants = await createVariants(totalN, state, (count, total)=>{
-        generated = count;
-        if(countEl) countEl.textContent = String(count);
-        if(barEl) barEl.style.width = Math.round((count/total)*100)+'%';
-      });
+      let variants = await createVariants(12, state);
       const total = variants.length;
       if(total === 0){
         wrap.innerHTML = '<div class="bmms-empty">No AI logos were generated. Please check your image generation endpoint or Fal.ai configuration, then retry.</div><div class="bmms-actions"><button class="bmms-btn bmms-btn-primary bmms-retry" type="button">Retry</button></div>';
         return;
       }
-      // Group variants into slides of 3 cards each
-      const groupSize = 3;
-      const slides = [];
-      for(let i=0;i<total;i+=groupSize){ slides.push(variants.slice(i, i+groupSize)); }
-      state.slides = slides;
+      state.slides = [ variants.slice(0,4), variants.slice(4,8), variants.slice(8,12) ];
       state.selected = null;
       let idx = 0;
       if(nextBtn) nextBtn.disabled = total === 0 || !state.selected;
@@ -3153,49 +2794,11 @@
     s5.addEventListener('click', function(e){
       const t=e.target;
       if(t.closest('.bmms-back')){ showStep('s4'); return; }
-      if(t.closest('.bmms-next')){ showStep('s6'); return; }
       if(t.closest('.bmms-zoom')){ const ov=q('.bmms-zoom-overlay', s5); const zi=q('#bmms-zoom-image', s5); const fin=q('#bmms-final-image', s5); if(ov && zi && fin){ zi.src=fin.src; ov.style.display='flex'; } }
       if(t.closest('.bmms-zoom-close')){ const ov=q('.bmms-zoom-overlay', s5); if(ov) ov.style.display='none'; }
       if(t.closest('.bmms-download')){ const fin=q('#bmms-final-image', s5); const src=fin?.src||''; if(src.startsWith('data:image/svg')){ svgToPng(src, 1200, 900).then(png=>download(png,'brand-logo.png')); } else { download(src,'brand-logo.png'); } }
     });
   }
-
-  // Step 6: Product selection
-  const s6 = steps.s6; if(s6){
-    const skuHost = q('.bmms-sku-list', s6);
-    const nextBtn = q('.bmms-next', s6);
-    const catGrid = q('.bmms-category-grid', s6);
-    const skuMap = {
-      'Energy': [ {id:'EN001', name:'Energy Drink – Citrus', img:'energy_citrus.jpg'}, {id:'EN002', name:'Energy Shot – Berry', img:'energy_shot.jpg'} ],
-      'Beauty': [ {id:'BE001', name:'Face Serum – Glow', img:'serum_glow.jpg'}, {id:'BE002', name:'Lip Balm – Mint', img:'lip_mint.jpg'} ],
-      'Fitness': [ {id:'FI001', name:'Protein – Vanilla', img:'protein_vanilla.jpg'}, {id:'FI002', name:'Electrolytes – Lemon', img:'electro_lemon.jpg'} ],
-      'Pets': [ {id:'PE001', name:'Pet Shampoo – Gentle', img:'pet_shampoo.jpg'} ],
-      'Outdoor': [ {id:'OU001', name:'Hydration Bottle – 32oz', img:'bottle.jpg'} ],
-      'Home': [ {id:'HO001', name:'Scented Candle – Ocean', img:'candle_ocean.jpg'} ]
-    };
-    function renderSkus(cat){ if(!skuHost) return; skuHost.innerHTML=''; const list=skuMap[cat]||[]; if(list.length){ skuHost.style.display=''; } else { skuHost.style.display='none'; }
-      list.forEach(sku=>{ const btn=document.createElement('button'); btn.type='button'; btn.className='bmms-btn bmms-sku'; btn.textContent=`${sku.name}`; btn.dataset.sku = sku.id; btn.addEventListener('click', ()=>{ state.productSku = sku.id; state.productName = sku.name; if(nextBtn) nextBtn.disabled = false; }); skuHost.appendChild(btn); }); }
-    if(catGrid){ catGrid.addEventListener('click', function(e){ const b=e.target.closest('.bmms-cat'); if(!b) return; const cat=b.dataset.cat; state.productCategory=cat; renderSkus(cat); }); }
-    s6.addEventListener('click', function(e){ const t=e.target; if(t.closest('.bmms-back')){ showStep('s5'); return; } if(t.closest('.bmms-next')){ showStep('s7'); setTimeout(()=>{ const sp=q('.bmms-splash', s7); if(sp) sp.style.display='none'; const fin=q('.bmms-final', s7); if(fin) fin.style.display=''; const prev=q('#bmms-nudge-preview', s7); const src=q('#bmms-final-image')?.src||''; if(prev&&src) prev.src=src; }, 900); } });
-  }
-
-  // Step 7: Preview nudges
-  const s7 = steps.s7; if(s7){
-    s7.addEventListener('click', function(e){ const t=e.target; if(t.closest('.bmms-back')){ showStep('s6'); return; } const img = q('#bmms-nudge-preview', s7); if(!img) return; const style = img.style; if(t.closest('.bmms-nudge-up')){ const top=(parseInt(style.marginTop||'0',10)||0) - 6; style.marginTop = top+'px'; }
-      if(t.closest('.bmms-nudge-down')){ const top=(parseInt(style.marginTop||'0',10)||0) + 6; style.marginTop = top+'px'; }
-      if(t.closest('.bmms-nudge-bigger')){ const w=(parseInt(style.width||'0',10)||0) || img.naturalWidth; style.width = ((w*1.06)|0)+'px'; }
-      if(t.closest('.bmms-nudge-smaller')){ const w=(parseInt(style.width||'0',10)||0) || img.naturalWidth; style.width = ((w/1.06)|0)+'px'; }
-      if(t.closest('.bmms-nudge-bg')){ img.classList.toggle('alt-bg'); }
-      if(t.closest('.bmms-next')){ showStep('s8'); setTimeout(()=>{ const sp=q('.bmms-splash', s8); if(sp) sp.style.display='none'; const fld=q('.bmms-fields', s8); if(fld) fld.style.display=''; const fInp=q('input[name="followers"]', s8); if(fInp){ fInp.value = fInp.value || '10000'; } const cInp=q('input[name="conv"]', s8); if(cInp){ cInp.value = cInp.value || '2'; } updateProfit(); }, 900); }
-    });
-  }
-
-  function updateProfit(){ const s8 = steps.s8; if(!s8) return; const f=Number(q('input[name="followers"]', s8)?.value||0); const conv=Number(q('input[name="conv"]', s8)?.value||2)/100; const price=Number(q('input[name="price"]', s8)?.value||19); const margin=Number(q('input[name="margin"]', s8)?.value||50)/100; const buyers = Math.round(f * conv); const revenue = buyers * price; const profit = Math.round(revenue * margin); const host=q('.bmms-profit-result', s8); if(host){ host.textContent = `Estimated buyers: ${buyers} • Revenue: $${revenue.toLocaleString()} • Profit: $${profit.toLocaleString()}`; } }
-  // Step 8 handlers
-  const s8 = steps.s8; if(s8){ s8.addEventListener('input', function(e){ updateProfit(); }); s8.addEventListener('click', function(e){ const t=e.target; if(t.closest('.bmms-back')){ showStep('s7'); return; } if(t.closest('.bmms-next')){ showStep('s9'); setTimeout(()=>{ const sp=q('.bmms-splash', s9); if(sp) sp.style.display='none'; const fld=q('.bmms-fields', s9); if(fld) fld.style.display=''; }, 900); } }); }
-
-  // Step 9 handlers
-  const s9 = steps.s9; if(s9){ s9.addEventListener('click', async function(e){ const t=e.target; if(t.closest('.bmms-back')){ showStep('s8'); return; } if(t.closest('.bmms-next')){ const meta = { styles:(state.styles||[]), product:{ sku: state.productSku||'', name: state.productName||'', category: state.productCategory||'' } }; await sendGhlTag('AGUI_AssetsReady', meta); try{ alert('Booked! We’ll email your summary and assets links.'); }catch(_){} } }); }
 
   function download(dataUrl, name){ const a=document.createElement('a'); a.href=dataUrl; a.download=name||'download.png'; document.body.appendChild(a); a.click(); setTimeout(()=>a.remove(),100); }
 
@@ -3221,7 +2824,8 @@
     return chosen;
   }
 
-  async function createVariants(n, st, onProgress){ 
+  async function createVariants(n, st){ 
+    const arr=[];
     const name = (st.brand_text||st.name||'Your Brand');
     const description = st.description || '';
     const icon = st.icon || 'modern';
@@ -3240,8 +2844,7 @@
 
     // Create AI prompts for logo variations
     const emailPart = email ? ` Contact email: ${email}.` : '';
-    const styleSeeds = buildStyleSeeds(st.styles || []);
-    const basePrompt = `Create a professional logo for "${name}". Business description: ${description}. Style: ${iconStyle}.` + (styleSeeds ? ` ${styleSeeds}` : '') + emailPart + ((st && st.selectedIdea) ? ' Use the provided reference image as the foundation for layout and iconography.' : '');
+    const basePrompt = `Create a professional logo for "${name}". Business description: ${description}. Style: ${iconStyle}.` + emailPart + ((st && st.selectedIdea) ? ' Use the provided reference image as the foundation for layout and iconography.' : '');
 
     // Map selected reference image to canonical style labels
     const selectedIdeaName = (function(){
@@ -3296,23 +2899,12 @@
       }
     }
 
-    // Multi-endpoint fallback: prefer WordPress REST first, then Agent (incl. toggled scheme), then FastAPI
+    // Multi-endpoint fallback: try WP REST, then Agent, then FastAPI if configured
     const cfg = window.AGUiConfig || window.AGConfig || {};
-    const wp = (cfg.wpImageEndpoint || '/wp-json/agui-chat/v1/image/generate').replace(/\/$/, '');
+    const wp = (cfg.wpImageEndpoint || '').replace(/\/$/, '') || '/wp-json/agui-chat/v1/image/generate';
     const agent = (cfg.agentImageEndpoint || '').replace(/\/$/, '');
-    // Prefer explicit fastApiImageEndpoint; otherwise derive from fastApiBase
-    let fastApi = (cfg.fastApiImageEndpoint || '').replace(/\/$/, '');
-    if (!fastApi && cfg.fastApiBase) {
-      try { fastApi = (String(cfg.fastApiBase).replace(/\/$/, '')) + '/api/fal/generate'; } catch(e) {}
-    }
-    const toggledAgent = (function(){
-      try {
-        if (!agent) return '';
-        const u = new URL(agent, window.location.origin);
-        return (u.protocol === 'http:' ? 'https:' : 'http:') + '//' + u.host + (u.pathname || '') + (u.search || '');
-      } catch(e) { return ''; }
-    })();
-    let endpoints = [wp, agent, toggledAgent, fastApi].filter(Boolean);
+    const fastApi = (cfg.fastApiImageEndpoint || '').replace(/\/$/, '');
+    let endpoints = [wp, agent, fastApi].filter(Boolean);
 
     // Feature flag: allow disabling non-WordPress fallbacks entirely
     const disableAgentFallbacks = !!(cfg.disableAgentFallbacks || cfg.disableNonWpFallbacks);
@@ -3320,34 +2912,8 @@
       endpoints = [wp].filter(Boolean);
     }
 
-    const total = Math.min(n, variations.length);
-    const results = new Array(total);
-    let completed = 0;
-
-    const adaptiveTimeout = (ep, i) => {
-      try {
-        const u = new URL(ep, window.location.origin);
-        const isWp = u.pathname.startsWith('/wp-json/agui-chat');
-        const isAgent = u.hostname.includes('ngrok') || u.pathname.includes('/api/');
-        const isFastApi = /\/api\/fal\//.test(u.pathname);
-        let base = isWp ? 22000 : isAgent ? 38000 : isFastApi ? 26000 : 20000; // tighter for speed
-        return base + Math.min(i, 3) * 5000;
-      } catch(e){ return 20000; }
-    };
-
-    const chooseSteps = (ep, i) => {
-      try {
-        const u = new URL(ep, window.location.origin);
-        const isWp = u.pathname.startsWith('/wp-json/agui-chat');
-        const isAgent = u.hostname.includes('ngrok') || u.pathname.includes('/api/');
-        const isFastApi = /\/api\/fal\//.test(u.pathname);
-        // Slightly fewer steps to speed up; earlier variants get even fewer for quick feedback
-        const base = isWp ? 10 : isAgent ? 8 : isFastApi ? 10 : 10;
-        return Math.max(6, base - (i < 3 ? 2 : 0));
-      } catch(e){ return 10; }
-    };
-
-    const genOne = async (i) => {
+    // Generate logos using AI across available endpoints
+    for (let i = 0; i < Math.min(n, variations.length); i++) {
       let success = false;
       // Decide whether to include image_url (skip for localhost/.local to avoid Fal fetch failures)
       let imageUrl = '';
@@ -3361,13 +2927,22 @@
         }
       } catch(e) {}
 
+      const payload = {
+        prompt: variations[i],
+        image_url: imageUrl,
+        size: '1024x1024',
+        format: 'png',
+        guidance_scale: 3.5,
+        num_inference_steps: 25
+      };
+
       for (const endpoint of endpoints){
         try {
           // Banner reflects the primary endpoint
           if (i === 0 && endpoint === endpoints[0]) {
             try { getImageEndpoint(); } catch(e) {}
           }
-          const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+          const headers = { 'Content-Type': 'application/json' };
           try {
             const u = new URL(endpoint, window.location.origin);
             const isAgent = u.pathname.includes('/api/');
@@ -3378,36 +2953,27 @@
             }
           } catch(e) {}
 
-          const controller = new AbortController();
-          const timeoutMs = adaptiveTimeout(endpoint, i);
-          const tm = setTimeout(() => controller.abort(), timeoutMs);
-
-          const payload = {
-            prompt: variations[i],
-            image_url: imageUrl,
-            size: '512x512',
-            format: 'png',
-            guidance_scale: 3.0,
-            num_inference_steps: chooseSteps(endpoint, i)
-          };
-
           const response = await fetch(endpoint, {
             method: 'POST',
             headers,
-            body: JSON.stringify(payload),
-            signal: controller.signal
+            body: JSON.stringify(payload)
           });
-          clearTimeout(tm);
 
           if (response.ok) {
             const result = await response.json();
             const url = extractImageUrl(result);
             const clean = normalizeImageUrl(url);
-            // Reject SVG placeholders; try next endpoint for a real generated image
             if (clean && String(clean).startsWith('data:image/svg')){
-              console.warn('Ignoring SVG placeholder for variant', i, 'via', endpoint);
+              try {
+                const png = await svgToPng(clean, 1024, 1024);
+                arr.push({ id: 'ai_v' + i, dataUrl: png, prompt: variations[i], placeholder: true });
+                success = true;
+                break; // done for this variant
+              } catch(convErr) {
+                console.warn('SVG to PNG conversion failed for variant', i, convErr);
+              }
             } else if (clean) {
-              results[i] = { id: 'ai_v' + i, dataUrl: clean, prompt: variations[i] };
+              arr.push({ id: 'ai_v' + i, dataUrl: clean, prompt: variations[i] });
               success = true;
               break; // done for this variant
             } else {
@@ -3417,33 +2983,15 @@
             console.warn('Image generation not ok', response.status, response.statusText, 'via', endpoint);
           }
         } catch(error) {
-          if (error && (error.name === 'AbortError' || String(error).includes('aborted'))) {
-            console.warn('AI generation timed out via', endpoint, 'for variant', i, '— trying next endpoint.');
-          } else {
-            console.warn('AI generation failed via', endpoint, 'for variant', i, error);
-          }
+          console.warn('AI generation failed via', endpoint, 'for variant', i, error);
         }
       }
 
-      if (success) {
-        completed++;
-        if (typeof onProgress === 'function') { try { onProgress(completed, total); } catch(e){} }
+      if (!success) {
+        // Skip variant if all endpoints failed
       }
-      return success;
-    };
+    }
 
-    const limit = Math.max(1, Number(cfg.variantConcurrency || 3));
-    const tasks = new Array(total).fill(0).map((_,i)=> ()=> genOne(i));
-    const workers = new Array(Math.min(limit, tasks.length)).fill(0).map(async function run(){
-      while (tasks.length){
-        const next = tasks.shift();
-        if (!next) break;
-        try { await next(); } catch(e){}
-      }
-    });
-    await Promise.all(workers);
-
-    const arr = results.filter(Boolean);
     return arr; 
   }
   function makeSvg(icon, text, primary, bg, desc, idx){
@@ -3474,7 +3022,6 @@
       candidates.push(data.image_base64);
       candidates.push(data.base64);
       candidates.push(data?.images?.[0]?.url);
-      candidates.push(data?.response?.images?.[0]?.url);
       candidates.push(data?.output?.images?.[0]?.url);
       candidates.push(data?.result?.images?.[0]?.url);
       candidates.push(data?.data?.images?.[0]?.url);
@@ -3484,45 +3031,13 @@
       candidates.push(data?.image?.url);
       candidates.push(data?.image?.data_uri);
       candidates.push(data?.image?.base64);
-      let found = candidates.find(u => typeof u==='string' && u);
-      if(found) return found;
-
-      // Deep scan for any string value that looks like an image URL/URI/base64/SVG
-      const isImgString = (s) => {
-        if (typeof s !== 'string' || !s) return false;
-        const t = s.trim();
-        if (/^data:image\//i.test(t)) return true;           // data URI
-        if (/^https?:\/\//i.test(t)) return true;           // http/https URL
-        if (/^<svg[\s\S]*<\/svg>$/i.test(t)) return true;  // raw SVG markup
-        if (/^[A-Za-z0-9+/=]+$/.test(t) && t.length > 100) return true; // raw base64
-        return false;
-      };
-      const walk = (v) => {
-        try{
-          if (isImgString(v)) return v;
-          if (Array.isArray(v)){
-            for (const item of v){ const res = walk(item); if (res) return res; }
-          } else if (v && typeof v === 'object'){
-            // Prefer common image-related keys first
-            const preferred = ['image','image_url','url','data_uri','dataUrl','base64','image_base64','b64_json','content','data'];
-            const keys = Object.keys(v);
-            keys.sort((a,b)=> preferred.indexOf(a) - preferred.indexOf(b));
-            for (const k of keys){ const res = walk(v[k]); if (res) return res; }
-          }
-        }catch(e){}
-        return '';
-      };
-      found = walk(data);
-      if (found && /^<svg/i.test(found)){
-        // Wrap raw SVG markup as a data URI so it can be displayed/converted
-        return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(found);
-      }
+      const found = candidates.find(u => typeof u==='string' && u);
       return found || '';
     } catch(e){ return ''; }
   }
 
   // Init: show first step on load
-  restore();
+  showStep('s1');
 })();
 
    })();
