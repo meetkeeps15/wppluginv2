@@ -57,11 +57,16 @@
       sseUrl: '',
       wsUrl: '',
       sendUrl: '',
+      // Live settings sync so the preview can pick up WP/Agent endpoints from the server
+      wpSettingsEndpoint: '/wp-json/agui-chat/v1/settings',
       wpFormEndpoint: '/wp-json/agui-chat/v1/ghl/contact',
-      wpSendEndpoint: '/wp-json/agui-chat/v1/agent/send',
+      wpSendEndpoint: '/wp-json/agui-chat/v1/agency/respond',
       wpImageEndpoint: '/wp-json/agui-chat/v1/image/generate',
-      agentImageEndpoint: 'http://127.0.0.1:8000/api/fal/generate',
-      fastApiBase: 'http://127.0.0.1:8000',
+      wpAgencyRespond: '/wp-json/agui-chat/v1/agency/respond',
+      wpAgencyStream: '/wp-json/agui-chat/v1/agency/stream',
+      // Leave agent/fastapi empty in preview; the server stub will inject these via /settings when configured
+      agentImageEndpoint: '',
+      fastApiBase: '',
       // Feature flag: disable non-WP fallback endpoints during preview
       disableNonWpFallbacks: true
     };

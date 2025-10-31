@@ -18,23 +18,19 @@ class WP_AGUI_Chat_Plugin {
     add_shortcode('agui_chat', [$this, 'shortcode_agui_chat']);
     add_shortcode('bm_chat', [$this, 'shortcode_bm_chat']);
     add_shortcode('bm_ms_form', [$this, 'shortcode_bm_ms_form']);
+    // React/Vite wizard built once, then served as static assets
+    add_shortcode('bm_wizard', [$this, 'shortcode_bm_wizard']);
   }
 
   public static function defaults(){
     return [
-      'sse_url' => 'https://localhost:8787/agui/sse',
-      'ws_url'  => 'wss://localhost:8787/agui/ws',
-      'send_url'=> 'https://localhost:8787/agui/send',
-      'prefer_ws' => true,
       // Optional Agency API (FastAPI) for tools like image generation
-      'fastapi_base' => 'http://127.0.0.1:8800',
+      'fastapi_base' => 'https://backend-320531488581.us-central1.run.app',
       'db_token' => '',
-      // Fal AI (server-side proxy from WordPress)
-      'fal_key' => '43f4b24d-deeb-4ee4-ac35-cc5d02437a7b:0eb26cf70ce9cf72da2d21ac7ff472b3',
-      'fal_model' => 'fal-ai/flux-pro/v1/fill',
-      // Banana.dev (primary image generation)
-      'banana_key' => '',
-      'banana_model' => '',
+      // Fal.ai cloud image generation (optional)
+      // Set via WP Admin or environment variables (FAL_KEY, FAL_MODEL)
+      'fal_key' => '',
+      'fal_model' => 'fal-ai/flux/schnell',
 
       // GoHighLevel integration defaults
       'ghl_pit' => 'pit-ca167896-6606-4d07-b042-d294e6bf8d2d',
@@ -53,12 +49,22 @@ class WP_AGUI_Chat_Plugin {
         'deals'   => 'https://brandmenow.ai/api/crm/deals',
         'tickets' => 'https://brandmenow.ai/api/crm/tickets',
       ],
-      'fallback_url' => 'http://127.0.0.1:8000/api/ask',
+      // Fallback URL removed; using Agency backend via WordPress proxy only
     ];
   }
 
   public static function get_settings(){
     return wp_parse_args(get_option(self::OPTION_KEY, []), self::defaults());
+  }
+
+  // Helper: sanitize and normalize URLs coming from settings (removes quotes/backticks/spaces and trailing slashes)
+  private static function clean_url($raw){
+    $clean = trim((string)$raw);
+    $clean = trim($clean, " \t\n\r\0\x0B`'\"");
+    // esc_url_raw will reject invalid schemes; keep only http/https
+    $clean = esc_url_raw($clean);
+    // Normalize by removing trailing slash
+    return rtrim($clean, '/');
   }
 
   public function enqueue_assets(){
@@ -80,14 +86,7 @@ class WP_AGUI_Chat_Plugin {
       }
     }
     wp_localize_script('agui-chat-js', 'AGUiConfig', [
-      'sseUrl' => $cfg['sse_url'],
-      'wsUrl'  => $cfg['ws_url'],
-      'sendUrl'=> $cfg['send_url'],
-      'fallbackUrl' => $cfg['fallback_url'],
-      // Prefer server-side proxy for SEND via WordPress to avoid TLS/mixed-content issues
-      'wpSendEndpoint' => rest_url('agui-chat/v1/agent/send'),
-      'preferWebSocket' => !!$cfg['prefer_ws'],
-      'forceNonStreaming' => true, // Temporary: disable SSE/WS until endpoints are confirmed working
+      // Simplified config: using WordPress REST proxies and Agency backend only
       'wpFormEndpoint' => rest_url('agui-chat/v1/ghl/contact'),
       'fastApiBase' => $cfg['fastapi_base'],
       'dbToken' => $cfg['db_token'],
@@ -95,6 +94,9 @@ class WP_AGUI_Chat_Plugin {
       'wpImageEndpoint' => rest_url('agui-chat/v1/image/generate'),
       // Server-side brand name generation endpoint used in Step 3
       'wpBrandnameEndpoint' => rest_url('agui-chat/v1/brandname/generate'),
+      // New: General Agency endpoints for BrandVision / NameSelector, etc.
+      'wpAgencyRespond' => rest_url('agui-chat/v1/agency/respond'),
+      'wpAgencyStream' => rest_url('agui-chat/v1/agency/stream'),
       'agentImageEndpoint' => $agent_image_endpoint,
       // Live settings endpoint so frontend can synchronize in real-time
       'wpSettingsEndpoint' => rest_url('agui-chat/v1/settings'),
@@ -448,42 +450,85 @@ class WP_AGUI_Chat_Plugin {
     return ob_get_clean();
   }
 
+  // React Wizard Shortcode: loads Vite-built assets from brand-me-now-wizard/dist
+  public function shortcode_bm_wizard($atts = [], $content = null){
+    $dist_assets_dir = plugin_dir_path(__FILE__) . 'brand-me-now-wizard/dist/assets/';
+    $dist_assets_url = plugins_url('brand-me-now-wizard/dist/assets/', __FILE__);
+
+    $js = '';
+    $css = '';
+    if (is_dir($dist_assets_dir)) {
+      // Pick the newest JS/CSS in assets (Vite generates hashed filenames)
+      $js_files = glob($dist_assets_dir . '*.js');
+      $css_files = glob($dist_assets_dir . '*.css');
+      if (!empty($js_files)) {
+        usort($js_files, function($a,$b){ return filemtime($b) <=> filemtime($a); });
+        $js = basename($js_files[0]);
+      }
+      if (!empty($css_files)) {
+        usort($css_files, function($a,$b){ return filemtime($b) <=> filemtime($a); });
+        $css = basename($css_files[0]);
+      }
+    }
+
+    ob_start();
+    echo '<section id="bm-wizard" class="bm-wizard-container" aria-label="BrandMe Now Wizard">';
+    // Helpful guidance if assets missing (show dynamic plugin folder path)
+    if (!$js) {
+      $plugin_folder = basename(rtrim(plugin_dir_path(__FILE__), '/\\'));
+      $expected_path = 'wp-content/plugins/' . $plugin_folder . '/brand-me-now-wizard/dist';
+      echo '<div class="bm-wizard-warning" style="border:1px solid #f59e0b; background:#fff7ed; color:#7c2d12; padding:12px; border-radius:6px; margin-bottom:12px">';
+      echo '<strong>Wizard assets not found.</strong> Build locally and upload the dist folder to <code>' . esc_html($expected_path) . '</code>.';
+      echo '</div>';
+    }
+    // Include CSS if present
+    if ($css) {
+      echo '<link rel="stylesheet" href="' . esc_url($dist_assets_url . $css) . '" />';
+    }
+    // Inject runtime config so the bundle can read correct endpoints even if hardcoded dev URLs exist
+    $cfg = self::get_settings();
+    $fastapi_base = self::clean_url($cfg['fastapi_base'] ?? '');
+    echo '<script>\n';
+    echo 'window.BMN_CONFIG = {';
+    echo 'fastapi_base: ' . json_encode($fastapi_base) . ',';
+    echo 'wpAgencyRespond: ' . json_encode(rest_url('agui-chat/v1/agency/respond')) . ',';
+    echo 'wpAgencyStream: ' . json_encode(rest_url('agui-chat/v1/agency/stream')) . ',';
+    echo 'wpSettingsEndpoint: ' . json_encode(rest_url('agui-chat/v1/settings'));
+    echo '};\n';
+    // Provide legacy alias used by some builds
+    echo 'window.__BMN_CONFIG__ = Object.assign({}, window.BMN_CONFIG, {';
+    echo 'wpSendEndpoint: ' . json_encode(rest_url('agui-chat/v1/agency/respond'));
+    echo '});\n';
+    echo '</script>';
+
+    // Root mount node
+    echo '<div id="root"></div>';
+    // Include the Vite-built JS as a module if present
+    if ($js) {
+      echo '<script type="module" src="' . esc_url($dist_assets_url . $js) . '"></script>';
+    }
+    echo '</section>';
+    return ob_get_clean();
+  }
+
   public function admin_menu(){
     add_menu_page('AG‑UI CRM', 'AG‑UI CRM', 'manage_options', 'agui-crm', [$this, 'render_admin'], 'dashicons-format-chat', 26);
   }
 
   public function register_settings(){
     register_setting('agui_crm', self::OPTION_KEY);
-
-    add_settings_section('agui_core', 'AG‑UI Endpoints', function(){
-      echo '<p>Configure AG‑UI connection endpoints (SSE/WebSocket) used by the chat UI.</p>';
-    }, 'agui_crm');
-
-    add_settings_field('sse_url', 'SSE URL', [$this, 'field_text'], 'agui_crm', 'agui_core', ['key'=>'sse_url']);
-    add_settings_field('ws_url',  'WebSocket URL', [$this, 'field_text'], 'agui_crm', 'agui_core', ['key'=>'ws_url']);
-    add_settings_field('send_url','Send URL', [$this, 'field_text'], 'agui_crm', 'agui_core', ['key'=>'send_url']);
-    add_settings_field('prefer_ws','Prefer WebSocket', [$this, 'field_checkbox'], 'agui_crm', 'agui_core', ['key'=>'prefer_ws']);
-    add_settings_field('fallback_url','Fallback URL', [$this, 'field_text'], 'agui_crm', 'agui_core', ['key'=>'fallback_url']);
-
     add_settings_section('agency_api', 'Agency API (FastAPI)', function(){
-      echo '<p>Optional: configure your local or hosted Agency API used for image generation and advanced tools.</p>';
+      echo '<p>Configure your hosted Agency API base URL. WebSocket/SSE settings are no longer required for this setup.</p>';
     }, 'agui_crm');
     add_settings_field('fastapi_base', 'FastAPI Base URL', [$this, 'field_text'], 'agui_crm', 'agency_api', ['key'=>'fastapi_base']);
     add_settings_field('db_token', 'Bearer Token (DB_TOKEN, optional)', [$this, 'field_text'], 'agui_crm', 'agency_api', ['key'=>'db_token']);
-
-    add_settings_section('banana_ai', 'Banana.dev (Primary Image Generation)', function(){
-      echo '<p>Primary: configure Banana.dev for AI image generation. This will be tried first before falling back to Fal AI or local endpoints.</p>';
-    }, 'agui_crm');
-    add_settings_field('banana_key', 'Banana API Key', [$this, 'field_text'], 'agui_crm', 'banana_ai', ['key'=>'banana_key']);
-    add_settings_field('banana_model', 'Banana Model Key', [$this, 'field_text'], 'agui_crm', 'banana_ai', ['key'=>'banana_model']);
-
-    add_settings_section('fal_ai', 'Fal AI (Fallback)', function(){
-      echo '<p>Fallback: configure server-side Fal AI as a backup when Banana.dev is not available. This avoids mixed-content and reachability issues.</p>';
+    // Fal.ai cloud settings (optional)
+    add_settings_section('fal_ai', 'Fal.ai (optional)', function(){
+      echo '<p>Enable cloud image generation via <a href="https://fal.ai" target="_blank" rel="noopener">Fal.ai</a>. '
+         . 'Set your API Key and preferred model path. If not set, the plugin will fall back to your local /api/fal/generate LogoGenerator or a safe SVG placeholder.</p>';
     }, 'agui_crm');
     add_settings_field('fal_key', 'Fal API Key', [$this, 'field_text'], 'agui_crm', 'fal_ai', ['key'=>'fal_key']);
-    add_settings_field('fal_model', 'Fal Model', [$this, 'field_text'], 'agui_crm', 'fal_ai', ['key'=>'fal_model']);
-
-
+    add_settings_field('fal_model', 'Fal Model Path', [$this, 'field_text'], 'agui_crm', 'fal_ai', ['key'=>'fal_model']);
 
 
     add_settings_section('ghl', 'GoHighLevel (Private Integration)', function(){
@@ -583,6 +628,186 @@ class WP_AGUI_Chat_Plugin {
       'callback' => [$this, 'rest_brandname_generate'],
       'permission_callback' => '__return_true', // public; add nonce/rate-limit in production
     ]);
+
+    // New: General Agency proxy (non-streaming)
+    register_rest_route('agui-chat/v1', '/agency/respond', [
+      'methods' => 'POST',
+      'callback' => [$this, 'rest_agency_respond'],
+      'permission_callback' => '__return_true',
+    ]);
+
+    // New: General Agency proxy (streaming stub, currently falls back to non-streaming)
+    register_rest_route('agui-chat/v1', '/agency/stream', [
+      'methods' => 'POST',
+      'callback' => [$this, 'rest_agency_stream'],
+      'permission_callback' => '__return_true',
+    ]);
+  }
+
+  // Proxy to General Agency backend (non-streaming)
+  public function rest_agency_respond($request){
+    $data = $request->get_json_params();
+    if(!$data){ $data = $request->get_body_params(); }
+    if(!$data){
+      $raw = method_exists($request,'get_body') ? $request->get_body() : '';
+      if($raw){ $decoded = json_decode($raw, true); if(is_array($decoded)) $data = $decoded; }
+    }
+
+    $cfg = self::get_settings();
+    $base = self::clean_url($cfg['fastapi_base'] ?? '');
+    if(empty($base)){
+      return new WP_REST_Response(['ok'=>false,'error'=>'fastapi_base not configured'], 400);
+    }
+
+    // Build payload expected by General Agency
+    $payload = [
+      'recipient_agent' => $data['recipient_agent'] ?? '',
+      'message' => isset($data['message']) ? $data['message'] : ($data['input'] ?? ''),
+      'input' => $data['input'] ?? '',
+      'structured_output' => !empty($data['structured_output']),
+    ];
+    if(isset($data['context']) && is_array($data['context'])){ $payload['context'] = $data['context']; }
+    if(isset($data['params']) && is_array($data['params'])){ $payload['params'] = $data['params']; }
+    // Align with AG-UI protocol optional fields
+    if(isset($data['chat_history']) && is_array($data['chat_history'])){ $payload['chat_history'] = $data['chat_history']; }
+    if(isset($data['file_ids']) && is_array($data['file_ids'])){ $payload['file_ids'] = $data['file_ids']; }
+    if(isset($data['file_urls']) && is_array($data['file_urls'])){ $payload['file_urls'] = $data['file_urls']; }
+    if(isset($data['additional_instructions']) && is_string($data['additional_instructions'])){ $payload['additional_instructions'] = $data['additional_instructions']; }
+
+    // Prioritize confirmed upstream paths; retain legacy fallbacks for compatibility
+    $candidates = [
+      $base.'/general_agency/get_response',
+      $base.'/api/general_agency/get_response',
+      // legacy fallbacks
+      $base.'/agency/respond',
+      $base.'/general_agency',
+      $base.'/get_response',
+    ];
+
+    $last_error = null; $decoded = null; $status = 500;
+    // Optional Bearer authorization if configured
+    $headers = ['Content-Type' => 'application/json'];
+    $db_token = !empty($cfg['db_token']) ? $cfg['db_token'] : (getenv('DB_TOKEN') ?: '');
+    if ($db_token) { $headers['Authorization'] = 'Bearer ' . $db_token; }
+    foreach($candidates as $url){
+      $resp = wp_remote_post($url, [
+        'headers' => $headers,
+        'body' => json_encode($payload),
+        'timeout' => 25,
+      ]);
+      if(is_wp_error($resp)){
+        $last_error = $resp->get_error_message();
+        continue;
+      }
+      $code = wp_remote_retrieve_response_code($resp);
+      $body = wp_remote_retrieve_body($resp);
+      $try_json = json_decode($body, true);
+      if($code >= 200 && $code < 300 && is_array($try_json)){
+        $decoded = $try_json; $status = $code; break;
+      } else {
+        $last_error = 'Upstream returned '.$code.'; body: '.substr($body,0,500);
+      }
+    }
+
+    if(!$decoded){
+      return new WP_REST_Response(['ok'=>false,'error'=>'Agency upstream failed','details'=>$last_error], 502);
+    }
+
+    return new WP_REST_Response(['ok'=>true,'data'=>$decoded], $status);
+  }
+
+  // Streaming proxy: pass through SSE from Agency backend
+  public function rest_agency_stream($request){
+    $data = $request->get_json_params();
+    if(!$data){ $data = $request->get_body_params(); }
+    if(!$data){
+      $raw = method_exists($request,'get_body') ? $request->get_body() : '';
+      if($raw){ $decoded = json_decode($raw, true); if(is_array($decoded)) $data = $decoded; }
+    }
+
+    $cfg = self::get_settings();
+    $base = self::clean_url($cfg['fastapi_base'] ?? '');
+    if(empty($base)){
+      return new WP_REST_Response(['ok'=>false,'error'=>'fastapi_base not configured'], 400);
+    }
+
+    $payload = [
+      'recipient_agent' => $data['recipient_agent'] ?? '',
+      'message' => isset($data['message']) ? $data['message'] : ($data['input'] ?? ''),
+      'input' => $data['input'] ?? '',
+      'structured_output' => !empty($data['structured_output']),
+    ];
+    if(isset($data['context']) && is_array($data['context'])){ $payload['context'] = $data['context']; }
+    if(isset($data['params']) && is_array($data['params'])){ $payload['params'] = $data['params']; }
+    // Align with AG-UI protocol optional fields
+    if(isset($data['chat_history']) && is_array($data['chat_history'])){ $payload['chat_history'] = $data['chat_history']; }
+    if(isset($data['file_ids']) && is_array($data['file_ids'])){ $payload['file_ids'] = $data['file_ids']; }
+    if(isset($data['file_urls']) && is_array($data['file_urls'])){ $payload['file_urls'] = $data['file_urls']; }
+    if(isset($data['additional_instructions']) && is_string($data['additional_instructions'])){ $payload['additional_instructions'] = $data['additional_instructions']; }
+
+    $candidates = [
+      $base.'/general_agency/get_response_stream',
+      $base.'/api/general_agency/get_response_stream',
+      // legacy fallbacks
+      $base.'/get_response_stream',
+      $base.'/agency/stream',
+    ];
+
+    ignore_user_abort(true);
+    if(function_exists('set_time_limit')){ @set_time_limit(0); }
+    if(!headers_sent()){
+      header('Content-Type: text/event-stream');
+      header('Cache-Control: no-cache');
+      header('Connection: keep-alive');
+      header('X-Accel-Buffering: no');
+    }
+    while (ob_get_level() > 0) { @ob_end_flush(); }
+    @ob_implicit_flush(1);
+
+    $attempted = [];
+    foreach($candidates as $url){
+      $attempted[] = $url;
+      $ch = curl_init($url);
+      curl_setopt($ch, CURLOPT_POST, true);
+      // Build headers, include Accept for SSE; add optional Bearer token if configured
+      $curl_headers = ['Content-Type: application/json','Accept: text/event-stream'];
+      $db_token = !empty($cfg['db_token']) ? $cfg['db_token'] : (getenv('DB_TOKEN') ?: '');
+      if ($db_token) { $curl_headers[] = 'Authorization: Bearer ' . $db_token; }
+      curl_setopt($ch, CURLOPT_HTTPHEADER, $curl_headers);
+      curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+      curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
+      curl_setopt($ch, CURLOPT_WRITEFUNCTION, function($ch, $chunk){
+        echo $chunk;
+        @flush(); @ob_flush();
+        return strlen($chunk);
+      });
+      curl_setopt($ch, CURLOPT_TIMEOUT, 0);
+      curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+      curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+      curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+
+      $ok = curl_exec($ch);
+      $err = curl_error($ch);
+      $status = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+      curl_close($ch);
+
+      if($ok && !$err && $status >= 200 && $status < 300){
+        @flush(); @ob_flush();
+        exit;
+      } else {
+        continue;
+      }
+    }
+
+    $err_payload = [
+      'ok' => false,
+      'error' => 'Agency upstream SSE failed',
+      'attempted' => $attempted,
+    ];
+    echo 'event: error\n';
+    echo 'data: '.json_encode($err_payload).'\n\n';
+    @flush(); @ob_flush();
+    exit;
   }
 
   public function rest_ghl_contact($request){
@@ -1114,12 +1339,40 @@ class WP_AGUI_Chat_Plugin {
     $seed = isset($params['seed']) ? intval($params['seed']) : null;
     $format = isset($params['format']) ? $params['format'] : 'png';
     $model_override = isset($params['model']) ? trim($params['model']) : '';
+
+    // Optional brand color palette inputs
+    $palette_input = isset($params['palette']) ? $params['palette'] : (isset($params['brand_colors']) ? $params['brand_colors'] : (isset($params['colors']) ? $params['colors'] : ''));
+    $primary_color = isset($params['primary_color']) ? trim($params['primary_color']) : '';
+    $secondary_color = isset($params['secondary_color']) ? trim($params['secondary_color']) : '';
+    $accent_color = isset($params['accent_color']) ? trim($params['accent_color']) : '';
+    $neutral_color = isset($params['neutral_color']) ? trim($params['neutral_color']) : '';
+    $palette_colors = [];
+    $push_color = function($c) use (&$palette_colors){
+      $c = trim(strtolower($c));
+      if($c === '') return;
+      if(preg_match('/^#?[0-9a-f]{6}$/', $c)){
+        if($c[0] !== '#') $c = '#' . $c;
+        if(!in_array($c, $palette_colors)) $palette_colors[] = $c;
+      }
+    };
+    if(is_array($palette_input)){
+      foreach($palette_input as $c){ $push_color($c); }
+    } elseif(is_string($palette_input) && $palette_input !== ''){
+      $parts = preg_split('/[,\s]+/', $palette_input);
+      foreach($parts as $c){ $push_color($c); }
+    }
+    $push_color($primary_color); $push_color($secondary_color); $push_color($accent_color); $push_color($neutral_color);
+    $palette_hint = '';
+    if(count($palette_colors) > 0){
+      $palette_hint = ' Use color palette: ' . implode(', ', $palette_colors) . '. Maintain consistent contrast and brand tone; prefer transparent background.';
+    }
+    $prompt_final = trim($prompt . $palette_hint);
   
     $cfg = self::get_settings();
     $banana_key = trim($cfg['banana_key'] ?? '');
     $banana_model = trim($cfg['banana_model'] ?? '');
     $fal_key = trim($cfg['fal_key'] ?? (getenv('FAL_KEY') ?: ''));
-    $fal_model = trim($cfg['fal_model'] ?? (getenv('FAL_MODEL') ?: 'fal-ai/flux/schnell'));
+    $fal_model = trim($cfg['fal_model'] ?? (getenv('FAL_MODEL') ?: 'fal-ai/flux-pro/v1.1'));
     if(!empty($model_override)) { $fal_model = $model_override; }
     // If using a fill endpoint but mask_url is missing, fall back to a text-to-image endpoint to avoid errors
     if (stripos($fal_model, '/fill') !== false && empty($mask_url)) {
@@ -1127,7 +1380,7 @@ class WP_AGUI_Chat_Plugin {
     }
   
     // Build request body with whitelisted parameters
-    $body_arr = [ 'prompt' => $prompt, 'size' => $size, 'format' => $format ];
+    $body_arr = [ 'prompt' => $prompt_final, 'size' => $size, 'format' => $format ];
     if(!empty($image_url)) { $body_arr['image_url'] = $image_url; }
     if(!empty($mask_url)) { $body_arr['mask_url'] = $mask_url; }
     // Also include output_format for endpoints that expect this key
@@ -1144,44 +1397,68 @@ class WP_AGUI_Chat_Plugin {
     $edit_logo_input = isset($params['edit_logo_input']) ? $params['edit_logo_input'] : ($params['edit_prompt'] ?? '');
     $logo_body = [
       'brand_name' => $brand_name,
-      'prompt' => $prompt,
+      'prompt' => $prompt_final,
       'editing' => $editing,
       'logo_url' => $image_url ?: ($params['logo_url'] ?? ''),
       'edit_logo_input' => $edit_logo_input,
     ];
+    if(count($palette_colors) > 0){ $logo_body['palette'] = $palette_colors; $logo_body['colors'] = $palette_colors; }
 
-    // 1) Fast path: Fal.ai cloud (flux/schnell) if key configured
+    // 1) Fast path: Fal.ai cloud via fal.run if key configured
     if ($fal_key) {
-      // Use fal.run HTTP endpoint for Fal models
-      $url = 'https://fal.run/' . ltrim($fal_model, '/');
-      $headers = [
-        'Authorization' => 'Key ' . $fal_key,
-        'Content-Type' => 'application/json',
-        'Accept' => 'application/json',
-      ];
-      // Fal.run expects the payload under an "input" key
-      $resp = wp_remote_post($url, [
-        'headers' => $headers,
-        'body' => json_encode(['input' => $body_arr]),
-        'timeout' => 45,
-        // Allow self-signed/outdated cert bundles on some hosts to avoid SSL errors
-        'sslverify' => false,
-      ]);
-      if (!is_wp_error($resp)) {
-        $code = wp_remote_retrieve_response_code($resp);
-        $json = json_decode(wp_remote_retrieve_body($resp), true);
-        if ($code >= 200 && $code < 300) {
-          $img = $this->find_image_url($json);
-          if ($img) {
-            return new WP_REST_Response(['ok' => true, 'status' => $code, 'data' => ['image_url' => $img, 'model_used' => $fal_model]], $code);
-          }
-          // Otherwise, continue to faster local fallbacks
+      try {
+        // Build Fal payload with proper keys
+        $image_size = 'square_hd';
+        if (preg_match('/^1024x1024$/', $size)) { $image_size = 'square_hd'; }
+        // Choose model variant automatically if editing inputs are present
+        if ((!empty($image_url) || !empty($mask_url)) && stripos($fal_model, '/fill') === false) {
+          $fal_model = 'fal-ai/flux-pro/v1/fill';
         }
+
+        $falPayload = [
+          'prompt' => ($prompt_final ?: 'professional logo design'),
+          'image_size' => $image_size,
+        ];
+        if (!empty($image_url)) { $falPayload['image_url'] = $image_url; }
+        if (!empty($mask_url)) { $falPayload['mask_url'] = $mask_url; }
+        if ($guidance !== null) { $falPayload['guidance_scale'] = $guidance; }
+        if ($steps !== null) { $falPayload['num_inference_steps'] = $steps; }
+        if ($seed !== null) { $falPayload['seed'] = $seed; }
+
+        $url = 'https://fal.run/' . ltrim($fal_model, '/');
+        $headers = [
+          'Authorization' => 'Key ' . $fal_key,
+          'Content-Type' => 'application/json',
+          'Accept' => 'application/json',
+        ];
+        $resp = wp_remote_post($url, [
+          'headers' => $headers,
+          'body' => json_encode($falPayload),
+          'timeout' => 45,
+          'sslverify' => false,
+        ]);
+        if (!is_wp_error($resp)) {
+          $code = wp_remote_retrieve_response_code($resp);
+          $raw = wp_remote_retrieve_body($resp);
+          $json = json_decode($raw, true);
+          if ($code >= 200 && $code < 300) {
+            // Fal responses often include images array with urls
+            $img = $this->find_image_url($json);
+            if ($img) {
+              return new WP_REST_Response(['ok' => true, 'status' => $code, 'data' => ['image_url' => $img, 'model_used' => $fal_model]], $code);
+            }
+          }
+          // If non-200 or no image found, continue to fallbacks
+        }
+      } catch (\Exception $e) {
+        // Ignore and continue to fallbacks
       }
     }
   
     // 2) FastAPI fallback (LogoGenerator)
-    $fast_base = !empty($cfg['fastapi_base']) ? $cfg['fastapi_base'] : (getenv('FASTAPI_BASE') ?: 'http://127.0.0.1:8000');
+    $fast_base_cfg = self::clean_url($cfg['fastapi_base'] ?? '');
+    $fast_base_env = self::clean_url(getenv('FASTAPI_BASE') ?: '');
+    $fast_base = $fast_base_cfg ?: ($fast_base_env ?: 'http://127.0.0.1:8000');
     $fast_url = rtrim($fast_base, '/') . '/api/fal/generate';
     $headers_fast = [ 'Content-Type' => 'application/json' ];
     $db_token = !empty($cfg['db_token']) ? $cfg['db_token'] : (getenv('DB_TOKEN') ?: '');
@@ -1212,10 +1489,23 @@ class WP_AGUI_Chat_Plugin {
       }
     }
   
-    // 4) Local agent-server proxy (LogoGenerator)
-    $agent_base = getenv('AGENT_BASE') ?: 'http://127.0.0.1:8787';
-    $agent_url = rtrim($agent_base, '/') . '/api/fal/generate';
-    $resp2 = wp_remote_post($agent_url, [
+    // 4) Agent-image fallback: prefer explicit AGENT_IMAGE_ENDPOINT or derive from FASTAPI_BASE; finally local agent
+    $agent_image_env = self::clean_url(getenv('AGENT_IMAGE_ENDPOINT') ?: '');
+    $agent_image = '';
+    if (!empty($agent_image_env)) {
+      $agent_image = rtrim($agent_image_env, '/');
+    } else {
+      $fast_base_cfg2 = self::clean_url($cfg['fastapi_base'] ?? '');
+      $fast_base_env2 = self::clean_url(getenv('FASTAPI_BASE') ?: '');
+      if (!empty($fast_base_cfg2)) { $agent_image = rtrim($fast_base_cfg2, '/') . '/api/fal/generate'; }
+      else if (!empty($fast_base_env2)) { $agent_image = rtrim($fast_base_env2, '/') . '/api/fal/generate'; }
+    }
+    if (empty($agent_image)) {
+      // Final local fallback for development
+      $agent_base = getenv('AGENT_BASE') ?: 'http://127.0.0.1:8787';
+      $agent_image = rtrim($agent_base, '/') . '/api/fal/generate';
+    }
+    $resp2 = wp_remote_post($agent_image, [
       'headers' => [ 'Content-Type' => 'application/json' ],
       'body' => json_encode($logo_body),
       'timeout' => 20,
@@ -1365,38 +1655,37 @@ $disable_fallback = is_string($disable_fallback_env)
   // Fix 500s: implement /agui-chat/v1/settings to expose safe, non-secret settings
   public function rest_settings($request){
     $cfg = self::get_settings();
-    // Derive agent-server image endpoint from send_url origin
-    $agent_image_endpoint = '';
-    if (!empty($cfg['send_url'])) {
-      $parts = parse_url($cfg['send_url']);
-      if ($parts && isset($parts['scheme']) && isset($parts['host'])) {
-        $origin = $parts['scheme'] . '://' . $parts['host'] . (isset($parts['port']) ? ':' . $parts['port'] : '');
-        $agent_image_endpoint = rtrim($origin, '/') . '/api/fal/generate';
-      }
-    }
+    $fal_key = trim($cfg['fal_key'] ?? (getenv('FAL_KEY') ?: ''));
+    $fast_base_cfg = self::clean_url($cfg['fastapi_base'] ?? '');
+    $fast_base_env = self::clean_url(getenv('FASTAPI_BASE') ?: '');
+    $agent_image_env = self::clean_url(getenv('AGENT_IMAGE_ENDPOINT') ?: '');
+    $agent_image = '';
+    if (!empty($agent_image_env)) { $agent_image = rtrim($agent_image_env, '/'); }
+    else if (!empty($fast_base_cfg)) { $agent_image = rtrim($fast_base_cfg, '/') . '/api/fal/generate'; }
+    else if (!empty($fast_base_env)) { $agent_image = rtrim($fast_base_env, '/') . '/api/fal/generate'; }
     $public = [
-      'sse_url' => $cfg['sse_url'] ?? '',
-      'ws_url' => $cfg['ws_url'] ?? '',
-      'send_url' => $cfg['send_url'] ?? '',
-      'prefer_ws' => !empty($cfg['prefer_ws']),
-      'fallback_url' => $cfg['fallback_url'] ?? '',
-      'fastapi_base' => $cfg['fastapi_base'] ?? '',
+      // Provide both snake and camel for maximal compatibility
+      'fastapi_base' => $fast_base_cfg,
+      'fastApiBase' => $fast_base_cfg,
       'crm_dashboards' => $cfg['crm_dashboards'] ?? [],
       'crm_apis' => $cfg['crm_apis'] ?? [],
       'ghl_location_id' => $cfg['ghl_location_id'] ?? '',
       'ghl_api_base' => $cfg['ghl_api_base'] ?? '',
       'ghl_version' => $cfg['ghl_version'] ?? '',
       // Non-secret endpoints for the frontend to use
-      'wpSendEndpoint' => rest_url('agui-chat/v1/agent/send'),
+      'wpSendEndpoint' => rest_url('agui-chat/v1/agency/respond'),
       'wpFormEndpoint' => rest_url('agui-chat/v1/ghl/contact'),
       'wpImageEndpoint' => rest_url('agui-chat/v1/image/generate'),
       'wpSettingsEndpoint' => rest_url('agui-chat/v1/settings'),
       'wpBookingWebhook' => rest_url('agui-chat/v1/ghl/webhook'),
-      'agentImageEndpoint' => $agent_image_endpoint,
+      'wpAgencyRespond' => rest_url('agui-chat/v1/agency/respond'),
+      'wpAgencyStream' => rest_url('agui-chat/v1/agency/stream'),
+      // Prefer explicit env; else derive from fastapi_base
+      'agentImageEndpoint' => $agent_image,
       // Helpful flags (do not expose actual tokens)
       'ghl_configured' => !empty($cfg['ghl_pit']) && !empty($cfg['ghl_location_id']),
       // Consider environment config as well
-      'fal_configured' => (!empty($cfg['fal_key']) || !empty(getenv('FAL_KEY'))),
+      'fal_configured' => !empty($fal_key),
       'version' => '0.1.2',
     ];
     return new WP_REST_Response(['ok' => true, 'data' => $public], 200);

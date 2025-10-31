@@ -71,7 +71,31 @@ const server = http.createServer(async (req,res)=>{
         let data = '';
         rs.on('data', (c) => data += c);
         rs.on('end', () => {
-          try { sendJson(res, rs.statusCode || 200, JSON.parse(data)); }
+          try {
+            const src = JSON.parse(data);
+            // Rewrite endpoints to use local preview proxy to avoid CORS in the browser
+            const AGENT_IMAGE_ENDPOINT = process.env.AGENT_IMAGE_ENDPOINT || '';
+            const FASTAPI_BASE = process.env.FASTAPI_BASE || '';
+            const FAL_KEY = process.env.FAL_KEY || '';
+            const out = { ...src };
+            // Ensure the client knows to poll this same settings endpoint
+            out.wpSettingsEndpoint = '/wp-json/agui-chat/v1/settings';
+            out.wpSendEndpoint = '/wp-json/agui-chat/v1/agency/respond';
+            out.wpFormEndpoint = '/wp-json/agui-chat/v1/ghl/contact';
+            out.wpImageEndpoint = '/wp-json/agui-chat/v1/image/generate';
+            out.wpAgencyRespond = '/wp-json/agui-chat/v1/agency/respond';
+            out.wpAgencyStream = '/wp-json/agui-chat/v1/agency/stream';
+            // Prefer explicit AGENT_IMAGE_ENDPOINT; else derive from FASTAPI_BASE
+            if (AGENT_IMAGE_ENDPOINT) {
+              out.agentImageEndpoint = AGENT_IMAGE_ENDPOINT;
+            } else if (FASTAPI_BASE) {
+              try { const b = String(FASTAPI_BASE).replace(/\/$/, ''); out.agentImageEndpoint = b + '/api/fal/generate'; } catch(_) {}
+            }
+            // Match frontend casing: fastApiBase
+            out.fastApiBase = FASTAPI_BASE || out.fastApiBase || '';
+            out.fal_configured = !!FAL_KEY || !!out.fal_configured;
+            sendJson(res, rs.statusCode || 200, out);
+          }
           catch(_) { res.writeHead(rs.statusCode || 200); res.end(data); }
         });
       });
@@ -79,52 +103,125 @@ const server = http.createServer(async (req,res)=>{
       rq.end();
       return;
     }
+    const WP_ORIGIN = process.env.WP_ORIGIN || '';
+    const AGENT_IMAGE_ENDPOINT = process.env.AGENT_IMAGE_ENDPOINT || '';
+    const FAL_KEY = process.env.FAL_KEY || '';
     const publicCfg = {
       sseUrl: '',
       wsUrl: '',
       sendUrl: '',
       preferWebSocket: false,
       fallbackUrl: '',
-      wpSendEndpoint: '/wp-json/agui-chat/v1/agent/send',
+      wpSettingsEndpoint: '/wp-json/agui-chat/v1/settings',
+      wpSendEndpoint: '/wp-json/agui-chat/v1/agency/respond',
       wpFormEndpoint: '/wp-json/agui-chat/v1/ghl/contact',
       wpImageEndpoint: '/wp-json/agui-chat/v1/image/generate',
-      fastApiBase: '',
+      fastApiBase: process.env.FASTAPI_BASE || '',
       dbToken: '',
-      agentImageEndpoint: 'http://127.0.0.1:8000/api/fal/generate'
+      agentImageEndpoint: AGENT_IMAGE_ENDPOINT || (WP_ORIGIN ? new URL('/api/fal/generate', WP_ORIGIN).href : '')
     };
+    publicCfg.fal_configured = !!FAL_KEY;
     return sendJson(res, 200, publicCfg);
   }
 
-  // Image generation endpoint: proxy to WP if WP_ORIGIN is set; otherwise proxy to Agent if AGENT_IMAGE_ENDPOINT is set; else 503
+  // Image generation endpoint: try Fal.ai first if FAL_KEY is set, then proxy to WP if WP_ORIGIN is set, then Agent if AGENT_IMAGE_ENDPOINT is set, else fallback
   if (pathname === '/wp-json/agui-chat/v1/image/generate') {
     const WP_ORIGIN = process.env.WP_ORIGIN || '';
     const AGENT_IMAGE_ENDPOINT = process.env.AGENT_IMAGE_ENDPOINT || '';
+    const FAL_KEY = process.env.FAL_KEY || '';
+    const FAL_MODEL = process.env.FAL_MODEL || 'fal-ai/flux-pro/v1/fill';
+    const DISABLE_IMAGE_FALLBACK = process.env.DISABLE_IMAGE_FALLBACK === 'true';
     const body = await parseBody(req);
-    if (WP_ORIGIN) {
-      const target = new url.URL('/wp-json/agui-chat/v1/image/generate', WP_ORIGIN);
-      const mod = target.protocol === 'https:' ? require('https') : require('http');
-      const rq = mod.request(target, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      }, (rs) => {
-        let data = '';
-        rs.on('data', (c) => data += c);
-        rs.on('end', () => {
-          try { sendJson(res, rs.statusCode || 200, JSON.parse(data)); }
-          catch(_) { res.writeHead(rs.statusCode || 200); res.end(data); }
-        });
-      });
-      rq.on('error', () => sendJson(res, 502, { error:'Proxy to WP image generate failed' }));
-      rq.end(JSON.stringify(body||{}));
-      return;
-    }
-    if (AGENT_IMAGE_ENDPOINT) {
+
+    // Try Fal.ai first if FAL_KEY is available
+    if (FAL_KEY) {
       try {
-        const target = new url.URL(AGENT_IMAGE_ENDPOINT);
+        const https = require('https');
+        
+        // Determine which model to use based on whether we have image_url/mask_url
+        let falModel = FAL_MODEL;
+        let falPayload = {};
+        
+        if (body.image_url || body.mask_url) {
+          // Use fill/inpainting model if image_url or mask_url provided
+          falModel = FAL_MODEL.includes('fill') ? FAL_MODEL : 'fal-ai/flux-pro/v1/fill';
+          falPayload = {
+            prompt: body.prompt || 'professional logo design',
+            image_size: body.size === '1024x1024' ? 'square_hd' : 'square_hd', // Convert to valid size
+            image_url: body.image_url || '',
+            mask_url: body.mask_url || '',
+            num_inference_steps: body.num_inference_steps || 28,
+            guidance_scale: body.guidance_scale || 3.5,
+            seed: body.seed || Math.floor(Math.random() * 1000000)
+          };
+        } else {
+          // Use text-to-image model for logo generation without base image
+          falModel = 'fal-ai/flux-pro/v1.1';
+          falPayload = {
+            prompt: body.prompt || 'professional logo design',
+            image_size: body.size === '1024x1024' ? 'square_hd' : 'square_hd', // Convert to valid size
+            num_inference_steps: body.num_inference_steps || 28,
+            guidance_scale: body.guidance_scale || 3.5,
+            seed: body.seed || Math.floor(Math.random() * 1000000)
+          };
+        }
+
+        const falUrl = `https://fal.run/${falModel}`;
+
+        const falReq = https.request(falUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Key ${FAL_KEY}`,
+            'Content-Type': 'application/json'
+          }
+        }, (falRes) => {
+          let falData = '';
+          falRes.on('data', (chunk) => falData += chunk);
+          falRes.on('end', () => {
+            try {
+              const falResult = JSON.parse(falData);
+              if (falRes.statusCode === 200 && falResult.images && falResult.images[0]) {
+                return sendJson(res, 200, {
+                  ok: true,
+                  status: 200,
+                  data: { image_url: falResult.images[0].url },
+                  source: 'fal.ai'
+                });
+              } else {
+                console.log('Fal.ai failed:', falRes.statusCode, falData);
+                // Fall through to other backends
+              }
+            } catch (e) {
+              console.log('Fal.ai parse error:', e.message);
+              // Fall through to other backends
+            }
+            // Continue to WP/Agent fallbacks if Fal.ai fails
+            tryWpOrAgentFallback();
+          });
+        });
+        
+        falReq.on('error', (e) => {
+          console.log('Fal.ai request error:', e.message);
+          // Continue to WP/Agent fallbacks if Fal.ai fails
+          tryWpOrAgentFallback();
+        });
+        
+        falReq.end(JSON.stringify(falPayload));
+        return; // Exit here, fallback will be called if needed
+      } catch (e) {
+        console.log('Fal.ai setup error:', e.message);
+        // Continue to WP/Agent fallbacks
+      }
+    }
+
+    // Fallback function for WP/Agent/SVG
+    function tryWpOrAgentFallback() {
+      if (WP_ORIGIN) {
+        const target = new url.URL('/wp-json/agui-chat/v1/image/generate', WP_ORIGIN);
         const mod = target.protocol === 'https:' ? require('https') : require('http');
         const rq = mod.request(target, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept':'application/json' }
+          headers: { 'Content-Type': 'application/json' }
         }, (rs) => {
           let data = '';
           rs.on('data', (c) => data += c);
@@ -133,14 +230,57 @@ const server = http.createServer(async (req,res)=>{
             catch(_) { res.writeHead(rs.statusCode || 200); res.end(data); }
           });
         });
-        rq.on('error', () => sendJson(res, 502, { error:'Proxy to Agent image generate failed' }));
+        rq.on('error', () => tryAgentFallback());
         rq.end(JSON.stringify(body||{}));
         return;
-      } catch(e) {
-        return sendJson(res, 500, { error:'Invalid AGENT_IMAGE_ENDPOINT' });
       }
+      tryAgentFallback();
     }
-    return sendJson(res, 503, { error:'No image generation backend configured. Set WP_ORIGIN or AGENT_IMAGE_ENDPOINT.' });
+
+    function tryAgentFallback() {
+      if (AGENT_IMAGE_ENDPOINT) {
+        try {
+          const target = new url.URL(AGENT_IMAGE_ENDPOINT);
+          const mod = target.protocol === 'https:' ? require('https') : require('http');
+          const rq = mod.request(target, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept':'application/json' }
+          }, (rs) => {
+            let data = '';
+            rs.on('data', (c) => data += c);
+            rs.on('end', () => {
+              try { sendJson(res, rs.statusCode || 200, JSON.parse(data)); }
+              catch(_) { res.writeHead(rs.statusCode || 200); res.end(data); }
+            });
+          });
+          rq.on('error', () => tryFinalFallback());
+          rq.end(JSON.stringify(body||{}));
+          return;
+        } catch(e) {
+          tryFinalFallback();
+        }
+      }
+      tryFinalFallback();
+    }
+
+    function tryFinalFallback() {
+      if (DISABLE_IMAGE_FALLBACK) {
+        return sendJson(res, 503, { error:'No image generation backend configured and fallback disabled.' });
+      }
+      // SVG placeholder fallback
+      const prompt = body.prompt || 'Brand Logo';
+      const svgData = svgFromPrompt(prompt);
+      const dataUri = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgData);
+      return sendJson(res, 200, {
+        ok: true,
+        status: 200,
+        data: { image_url: dataUri },
+        source: 'svg_placeholder'
+      });
+    }
+
+    // Start the fallback chain if Fal.ai wasn't attempted
+    tryWpOrAgentFallback();
   }
 
   // Contact creation endpoint (GHL stub)

@@ -39,7 +39,16 @@
   }catch(e){}
   const cfg = rawCfg;
   // Sanitize endpoints to avoid trailing semicolons or spaces from settings/debug copies
-  function sanitizeUrl(u){ try{ return String(u||'').trim().replace(/;+\s*$/, ''); }catch(e){ return u; } }
+  function sanitizeUrl(u){
+    try{
+      let s = String(u||'').trim();
+      // Strip wrapping backticks or quotes often present in copied configs
+      s = s.replace(/^[`'\"]+|[`'\"]+$/g, '');
+      // Remove trailing semicolons
+      s = s.replace(/;+\s*$/, '');
+      return s;
+    }catch(e){ return u; }
+  }
   cfg.wpFormEndpoint = sanitizeUrl(cfg.wpFormEndpoint || '');
   cfg.wpSettingsEndpoint = sanitizeUrl(cfg.wpSettingsEndpoint || '');
   cfg.wpSendEndpoint = sanitizeUrl(cfg.wpSendEndpoint || '');
