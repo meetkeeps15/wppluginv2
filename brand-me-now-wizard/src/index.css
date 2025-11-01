@@ -171,7 +171,9 @@ h2 {
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: gradientMove 3s ease infinite;
+  -webkit-text-fill-color: transparent; /* ensure proper text fill on WebKit */
+  animation: gradientMove 2.5s ease-in-out infinite;
+  will-change: background-position;
 }
 @keyframes gradientMove {
   0% { background-position: 0% 50%; }
