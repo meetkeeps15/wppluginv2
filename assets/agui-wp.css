@@ -529,8 +529,13 @@ body.with-sidebar .sidebar {
   position: fixed;
   top: 0;
   left: 0;
+  /* Use dynamic viewport units for reliable mobile sizing; keep classic vh/vw as fallbacks */
   width: 100vw;
+  width: 100svw;
+  width: 100dvw;
   height: 100vh;
+  height: 100svh;
+  height: 100dvh;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -564,6 +569,11 @@ body.with-sidebar .sidebar {
 .bm-ms-form .bmms-splash-header{display:flex; flex-direction:column; align-items:center; text-align:center}
 .bm-ms-form .bmms-fields{display:flex; flex-direction:column; gap:16px; max-width:500px; margin:16px auto}
 .bm-ms-form .actions{display:flex; gap:10px; justify-content:center; margin-top:16px}
+.bmms-actions{display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end}
+@media (max-width: 520px){
+  .bmms-actions{justify-content:center}
+  .bmms-actions .bmms-btn{flex:1 1 100%; max-width:480px}
+}
 .bmms-tip{color:#6b7280; font-size:13px; margin-top:8px}
 .bmms-close{position:absolute; top:14px; right:16px; border:none; background:transparent; font-size:24px; color:#64748b; cursor:pointer}
 .bm-ms-form .field input[type="text"],
@@ -639,6 +649,10 @@ body.with-sidebar .sidebar {
 .bmms-card.selected::after{content:'\2713';position:absolute;top:12px;left:12px;width:22px;height:22px;display:flex;align-items:center;justify-content:center;background:#22c55e;color:#fff;border-radius:50%;box-shadow:0 4px 10px rgba(0,0,0,.25);font-size:14px;font-weight:700;z-index:6}
 .bmms-card.selected{outline:2px solid #6366f1}
 .bmms-ideas{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}
+.bmms-ideas{grid-auto-rows:auto}
+@media (max-width: 1024px){ .bmms-ideas{grid-template-columns:repeat(4,minmax(0,1fr))} }
+@media (max-width: 768px){ .bmms-ideas{grid-template-columns:repeat(3,minmax(0,1fr))} }
+@media (max-width: 520px){ .bmms-ideas{grid-template-columns:repeat(2,minmax(0,1fr))} }
 .bmms-idea-card{display:block;border:1px solid #e5e7eb;border-radius:8px;padding:4px;}
 .bmms-idea-card img{display:block;width:100%;height:auto;border-radius:6px}
 .bmms-card img{max-width:100%; height:auto; border-radius:10px}
@@ -653,6 +667,11 @@ body.with-sidebar .sidebar {
 .bmms-zoom-overlay{position:fixed; inset:0; background:rgba(2,6,23,.5); display:flex; align-items:center; justify-content:center; z-index:9999}
 .bmms-zoom-inner{position:relative; background:#fff; padding:12px; border-radius:12px; box-shadow:0 12px 30px rgba(2,6,23,.24)}
 .bmms-zoom-inner img{max-width:92vw; max-height:86vh}
+
+/* Booking iframe and calendar wrapper responsiveness */
+.bmms-ghl-calendar{min-height:360px}
+.bmms-ghl-calendar iframe{width:100%; min-height:420px; border:none}
+@media (max-width:640px){ .bmms-ghl-calendar iframe{min-height:520px} }
 .bmms-zoom-close{position:absolute; top:4px; right:8px; border:none; background:transparent; font-size:28px; cursor:pointer}
 
 /* Inline errors, logo idea thumbs, and disabled actions */
@@ -664,6 +683,7 @@ body.with-sidebar .sidebar {
 @media (max-width:640px){
   .bmms-icon-grid{grid-template-columns:repeat(2,1fr)}
   .bmms-slide{grid-template-columns:1fr}
+  .bm-ms-form-content{padding:16px; border-radius:12px; width:100%;}
 }
 .bm-error{color:#b91c1c; font-size:var(--font-size-sm);} 
 

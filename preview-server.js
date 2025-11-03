@@ -103,7 +103,8 @@ const server = http.createServer(async (req,res)=>{
       rq.end();
       return;
     }
-    const WP_ORIGIN = process.env.WP_ORIGIN || '';
+    // Use distinct variable names to avoid duplicate const declarations in this block
+    const WP_ORIGIN_STUB = process.env.WP_ORIGIN || '';
     const AGENT_IMAGE_ENDPOINT = process.env.AGENT_IMAGE_ENDPOINT || '';
     const FAL_KEY = process.env.FAL_KEY || '';
     const publicCfg = {
@@ -118,7 +119,7 @@ const server = http.createServer(async (req,res)=>{
       wpImageEndpoint: '/wp-json/agui-chat/v1/image/generate',
       fastApiBase: process.env.FASTAPI_BASE || '',
       dbToken: '',
-      agentImageEndpoint: AGENT_IMAGE_ENDPOINT || (WP_ORIGIN ? new URL('/api/fal/generate', WP_ORIGIN).href : '')
+      agentImageEndpoint: AGENT_IMAGE_ENDPOINT || (WP_ORIGIN_STUB ? new URL('/api/fal/generate', WP_ORIGIN_STUB).href : '')
     };
     publicCfg.fal_configured = !!FAL_KEY;
     return sendJson(res, 200, publicCfg);
